@@ -38,4 +38,5 @@ ENV
 .vscode
 .idea
 Thumbs.db
-Desktop.ini
+Desktop.ininexus_ai.iss 
+nexus_ai.spec 
