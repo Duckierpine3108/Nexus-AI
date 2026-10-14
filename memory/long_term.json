@@ -1,0 +1,27 @@
+{
+  "identity": {
+    "language": {
+      "value": "English",
+      "updated": "2026-10-06"
+    },
+    "language_preference": {
+      "value": "English",
+      "updated": "2026-09-05"
+    },
+    "job": {
+      "value": "works in the field",
+      "updated": "2026-09-05"
+    }
+  },
+  "preferences": {},
+  "projects": {},
+  "relationships": {},
+  "wishes": {},
+  "notes": {
+    "C92_Max_info": {
+      "value": "Local Chinese smartwatch (C92 Max), non-PTA, tax 2500 PKR, limited banking app support, actual specs 2GB RAM/16GB storage (advertised 6GB/64GB), supports Play Store, dual camera, no NFC.",
+      "updated": "2026-09-28"
+    }
+  },
+  "sessions": []
+}

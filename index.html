@@ -1,0 +1,1252 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NEXUS // 3D CORE</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; user-select: none; }
+        html, body {
+            width: 100vw; height: 100vh;
+            background-color: #000000 !important;
+            overflow: hidden;
+            font-family: 'Segoe UI', sans-serif;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 1;
+            background-color: #000000;
+        }
+        #canvas-container {
+            width: 100vw;
+            height: 100vh;
+            position: absolute;
+            top: 0;
+            left: 0;
+            z-index: 1;
+            background-color: #000000;
+        }
+        #tracking-controls {
+            position: absolute;
+            top: 25px;
+            left: 25px;
+            display: flex;
+            gap: 12px;
+            z-index: 50;
+        }
+        .hud-btn {
+            background: rgba(0, 240, 255, 0.15);
+            border: 1px solid #00f0ff;
+            color: #00f0ff;
+            padding: 9px 16px;
+            font-family: monospace;
+            font-size: 12px;
+            font-weight: bold;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s ease;
+            box-shadow: 0 0 10px rgba(0, 240, 255, 0.2);
+            backdrop-filter: blur(8px);
+        }
+        .hud-btn.active {
+            background: #00f0ff;
+            color: #000000;
+            box-shadow: 0 0 15px #00f0ff;
+        }
+    </style>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/face_mesh.js" crossorigin="anonymous"></script>
+</head>
+<body>
+    <!-- Hidden webcam radar for in-engine MediaPipe tracking (No UI overlap) -->
+    <div id="webcam-radar" style="display:none;"><video id="webcam-video" autoplay playsinline muted></video></div>
+    <div id="canvas-container"></div>
+
+    <script>
+        const BAKED_CONFIG = { arm: { x: 64, y: 13, z: 11 }, shoulder: { x: 12, y: 0, z: 0 }, elbow: 0 };
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x030712);
+
+        // ── DUAL SPEECH INTENSITY & WATCHDOGS ─────────────────────────────────
+        var speechIntensity = 0.0;
+        var userSpeakingEnergy = 0.0;
+        var lastSpeechPulseTime = 0;
+        var lastUserSpeechTime = 0;
+        var AI_WATCHDOG_TIMEOUT = 200;    
+        var USER_WATCHDOG_TIMEOUT = 250;  
+
+        function triggerSpeechPulse() { lastSpeechPulseTime = performance.now(); }
+        function triggerUserSpeechPulse() { lastUserSpeechTime = performance.now(); }
+        function setAISpeakingDirect(speaking) { 
+            lastSpeechPulseTime = speaking ? performance.now() : 0; 
+            if (!speaking) speechIntensity = 0.0;
+        }
+        function setUserSpeakingDirect(speaking) { 
+            lastUserSpeechTime = speaking ? performance.now() : 0; 
+            if (!speaking) userSpeakingEnergy = 0.0;
+        }
+        function setAudioEnergyLevel(level) {
+            if (level > 0.02) {
+                triggerUserSpeechPulse();
+                userSpeakingEnergy = Math.max(userSpeakingEnergy, Math.min(1.0, level * 3.0));
+            }
+        }
+
+        // Full-screen portrait framing (Perfect headroom margin)
+        const camera = new THREE.PerspectiveCamera(36, window.innerWidth / window.innerHeight, 0.1, 100);
+        camera.position.set(0, 1.57, 1.05);
+
+        // Alpha: true enables clean transparency without black square borders
+        const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: "high-performance" });
+        renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setPixelRatio(Math.min(window.devicePixelRatio, 1.5));
+        renderer.setClearColor(0x030712, 1.0);
+        renderer.toneMapping = THREE.ACESFilmicToneMapping;
+        renderer.toneMappingExposure = 1.10;
+        renderer.outputEncoding = THREE.sRGBEncoding;
+        document.getElementById('canvas-container').appendChild(renderer.domElement);
+
+        const controls = new THREE.OrbitControls(camera, renderer.domElement);
+        controls.enableDamping = true;
+        controls.dampingFactor = 0.05;
+        controls.target.set(0, 1.55, 0);
+
+        const clock = new THREE.Clock();
+
+        const ambientLight = new THREE.AmbientLight(0xffffff, 0.9); scene.add(ambientLight);
+        const keyLight = new THREE.DirectionalLight(0xfff1e2, 1.5); keyLight.position.set(1.5, 2.2, 2.0); scene.add(keyLight);
+        const fillLight = new THREE.DirectionalLight(0xd0e2ff, 0.6); fillLight.position.set(-1.8, 1.8, 1.5); scene.add(fillLight);
+        const rimLight = new THREE.PointLight(0x00d2ff, 2.2, 6); rimLight.position.set(0, 2.0, -1.2); scene.add(rimLight);
+
+        // ── TARGET QUANTUM NEBULA GLASS ORB ──────────────────────────────────
+        const orbGroup = new THREE.Group();
+        orbGroup.position.set(0, 1.43, 0.14);
+        scene.add(orbGroup);
+
+        const ribbonVertexShader = `
+            uniform float time;
+            uniform float energy;
+            varying vec3 vColor;
+            varying float vAlpha;
+
+            void main() {
+                float u = position.x;
+                float v = position.y;
+                float ribbonId = position.z;
+
+                float speed = time * (0.65 + energy * 2.2);
+                float angle = u + ribbonId * (6.28318 / 3.0);
+
+                float w1 = sin(u * 2.5 + speed + ribbonId * 1.5) * 0.010;
+                float w2 = cos(u * 3.5 - speed * 0.8 + v * 3.1415) * 0.008;
+                float w3 = sin((u + v) * 3.0 + speed * 1.4) * 0.006 * (1.0 + energy * 1.2);
+
+                float r = 0.048 + w1 + w2 + w3;
+                float phi = v * 1.1 + sin(u * 2.0 + speed * 0.7) * 0.35;
+
+                vec3 p;
+                p.x = r * cos(angle) * cos(phi);
+                p.y = r * sin(phi) + (w1 * 0.5);
+                p.z = r * sin(angle) * cos(phi);
+
+                if (ribbonId > 1.5) {
+                    float c = 0.5, s = 0.866;
+                    p = vec3(p.x, p.y * c - p.z * s, p.y * s + p.z * c);
+                } else if (ribbonId > 0.5) {
+                    float c = 0.5, s = -0.866;
+                    p = vec3(p.x * c - p.y * s, p.x * s + p.y * c, p.z);
+                }
+
+                float maxR = 0.066;
+                float curLen = length(p);
+                if (curLen > maxR) p = (p / curLen) * maxR;
+
+                vec3 cCyan = vec3(0.0, 0.95, 1.0);
+                vec3 cMagenta = vec3(0.85, 0.22, 0.94);
+                vec3 cWhite = vec3(1.0, 1.0, 1.0);
+
+                float colorMix = sin(u * 2.0 + speed * 0.8 + p.y * 28.0) * 0.5 + 0.5;
+                vec3 col = mix(cCyan, cMagenta, colorMix);
+
+                float peak = pow(clamp(abs(w1 + w2) / 0.018, 0.0, 1.0), 2.0);
+                col = mix(col, cWhite, peak * (0.3 + energy * 0.5));
+
+                vColor = col;
+                vAlpha = clamp(0.35 + 0.55 * (1.0 - abs(v)) + energy * 0.35, 0.0, 1.0);
+
+                vec4 mvPosition = modelViewMatrix * vec4(p, 1.0);
+                gl_PointSize = (2.2 + energy * 1.6) * (1.0 / -mvPosition.z);
+                gl_Position = projectionMatrix * mvPosition;
+            }
+        `;
+
+        const particleFragmentShader = `
+            varying vec3 vColor;
+            varying float vAlpha;
+            void main() {
+                vec2 coord = gl_PointCoord - vec2(0.5);
+                float dist = length(coord);
+                if (dist > 0.5) discard;
+                float glow = pow(1.0 - (dist * 2.0), 2.0);
+                gl_FragColor = vec4(vColor, glow * vAlpha);
+            }
+        `;
+
+        const lineFragmentShader = `
+            varying vec3 vColor;
+            varying float vAlpha;
+            void main() {
+                gl_FragColor = vec4(vColor, vAlpha * 0.28);
+            }
+        `;
+
+        const ribbonGeo = new THREE.BufferGeometry();
+        const lineGeo = new THREE.BufferGeometry();
+        const verts = [];
+        const lineIndices = [];
+
+        const slicesU = 100;
+        const slicesV = 28;
+        let vertOffset = 0;
+
+        for (let layer = 0; layer < 3; layer++) {
+            const layerStart = vertOffset;
+            for (let i = 0; i <= slicesU; i++) {
+                const u = (i / slicesU) * Math.PI * 2.0;
+                for (let j = 0; j <= slicesV; j++) {
+                    const v = (j / slicesV) * 2.0 - 1.0;
+                    verts.push(u, v, layer);
+                    vertOffset++;
+                }
+            }
+            for (let i = 0; i < slicesU; i++) {
+                for (let j = 0; j < slicesV; j++) {
+                    const curr = layerStart + i * (slicesV + 1) + j;
+                    const nextU = layerStart + (i + 1) * (slicesV + 1) + j;
+                    const nextV = curr + 1;
+                    lineIndices.push(curr, nextU);
+                    lineIndices.push(curr, nextV);
+                }
+            }
+        }
+
+        const vertFloatArray = new Float32Array(verts);
+        ribbonGeo.setAttribute('position', new THREE.BufferAttribute(vertFloatArray, 3));
+        lineGeo.setAttribute('position', new THREE.BufferAttribute(vertFloatArray, 3));
+        lineGeo.setIndex(lineIndices);
+
+        const orbRibbonMat = new THREE.ShaderMaterial({
+            vertexShader: ribbonVertexShader,
+            fragmentShader: particleFragmentShader,
+            uniforms: { time: { value: 0.0 }, energy: { value: 0.0 } },
+            transparent: true,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false
+        });
+
+        const orbLineMat = new THREE.ShaderMaterial({
+            vertexShader: ribbonVertexShader,
+            fragmentShader: lineFragmentShader,
+            uniforms: { time: { value: 0.0 }, energy: { value: 0.0 } },
+            transparent: true,
+            blending: THREE.AdditiveBlending,
+            depthWrite: false
+        });
+
+        const ribbonPoints = new THREE.Points(ribbonGeo, orbRibbonMat);
+        const lineMesh = new THREE.LineSegments(lineGeo, orbLineMat);
+        orbGroup.add(ribbonPoints);
+        orbGroup.add(lineMesh);
+
+        const glassGeo = new THREE.SphereGeometry(0.076, 64, 64);
+        const glassMat = new THREE.ShaderMaterial({
+            vertexShader: `
+                varying vec3 vNormal;
+                varying vec3 vViewDir;
+                void main() {
+                    vNormal = normalize(normalMatrix * normal);
+                    vec4 worldPos = modelMatrix * vec4(position, 1.0);
+                    vViewDir = normalize(cameraPosition - worldPos.xyz);
+                    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+                }
+            `,
+            fragmentShader: `
+                varying vec3 vNormal;
+                varying vec3 vViewDir;
+                uniform float time;
+                uniform float energy;
+
+                void main() {
+                    float fresnel = 1.0 - max(dot(vNormal, vViewDir), 0.0);
+                    float rim = pow(fresnel, 2.5);
+
+                    vec3 colCyan = vec3(0.0, 0.95, 1.0);
+                    vec3 colMagenta = vec3(0.85, 0.24, 0.94);
+                    float angle = atan(vNormal.y, vNormal.x);
+                    float colorMix = sin(angle * 2.0 + time * 0.4) * 0.5 + 0.5;
+                    vec3 rimColor = mix(colCyan, colMagenta, colorMix);
+
+                    vec3 lightDir = normalize(vec3(0.3, 0.8, 0.8));
+                    vec3 halfVec = normalize(lightDir + vViewDir);
+                    float spec = pow(max(dot(vNormal, halfVec), 0.0), 32.0);
+
+                    vec3 finalCol = rimColor * rim * 1.8 + vec3(1.0) * spec * 0.7;
+                    float alpha = clamp(rim * 0.85 + spec * 0.55 + 0.02 + energy * 0.1, 0.0, 0.95);
+
+                    gl_FragColor = vec4(finalCol, alpha);
+                }
+            `,
+            uniforms: { time: { value: 0.0 }, energy: { value: 0.0 } },
+            transparent: true,
+            depthWrite: false,
+            side: THREE.FrontSide
+        });
+        const glassMesh = new THREE.Mesh(glassGeo, glassMat);
+        orbGroup.add(glassMesh);
+
+        const orbLight = new THREE.PointLight(0x00f2fe, 1.6, 2.8);
+        orbGroup.add(orbLight);
+
+        // ── GOOGLE COLORS & AMBIENT BLOBS ────────────────────────────────────
+        const GOOGLE_COLORS = [
+            new THREE.Color(0x4285F4),
+            new THREE.Color(0xEA4335),
+            new THREE.Color(0xFBBC05),
+            new THREE.Color(0x34A853)
+        ];
+        const MATRIX_GREEN_COLOR = new THREE.Color(0x00FF66);
+
+        let activeColorIndex = 0;
+        let lastColorSwitchTime = 0;
+        const currentAmbientColor = new THREE.Color(GOOGLE_COLORS[0]);
+        const targetAmbientColor = new THREE.Color(GOOGLE_COLORS[0]);
+
+        function createGlowTexture() {
+            const canvas = document.createElement('canvas');
+            canvas.width = 128; canvas.height = 128;
+            const ctx = canvas.getContext('2d');
+            const grad = ctx.createRadialGradient(64, 64, 0, 64, 64, 64);
+            grad.addColorStop(0.0, 'rgba(255, 255, 255, 1.0)');
+            grad.addColorStop(0.3, 'rgba(255, 255, 255, 0.45)');
+            grad.addColorStop(0.7, 'rgba(255, 255, 255, 0.08)');
+            grad.addColorStop(1.0, 'rgba(255, 255, 255, 0.0)');
+            ctx.fillStyle = grad;
+            ctx.fillRect(0, 0, 128, 128);
+            return new THREE.CanvasTexture(canvas);
+        }
+
+        const glowTexture = createGlowTexture();
+        const glowOrbsGroup = new THREE.Group();
+        scene.add(glowOrbsGroup);
+
+        const glowOrbs = [];
+        const orbConfigs = [
+            { x: -1.4, y: 1.8, z: -1.6, scale: 2.4, speedX: 0.25, speedY: 0.35, phase: 0.0 },
+            { x:  1.5, y: 1.2, z: -1.8, scale: 2.8, speedX: 0.30, speedY: 0.20, phase: 1.8 },
+            { x: -0.8, y: 0.9, z: -1.4, scale: 2.1, speedX: 0.35, speedY: 0.40, phase: 3.2 },
+            { x:  0.9, y: 2.1, z: -1.7, scale: 2.5, speedX: 0.20, speedY: 0.30, phase: 4.5 },
+            { x:  0.0, y: 1.5, z: -2.0, scale: 3.2, speedX: 0.15, speedY: 0.25, phase: 5.6 }
+        ];
+
+        orbConfigs.forEach(cfg => {
+            const mat = new THREE.SpriteMaterial({
+                map: glowTexture,
+                color: currentAmbientColor,
+                transparent: true,
+                opacity: 0.22,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            });
+            const sprite = new THREE.Sprite(mat);
+            sprite.position.set(cfg.x, cfg.y, cfg.z);
+            sprite.scale.set(cfg.scale, cfg.scale, 1.0);
+            glowOrbsGroup.add(sprite);
+            glowOrbs.push({ mesh: sprite, cfg: cfg });
+        });
+
+        // ── 4K MATRIX RAIN BACKGROUND ─────────────────────────────────────────
+        const mCanvas = document.createElement('canvas');
+        mCanvas.width = 1280; mCanvas.height = 720;
+        const mCtx = mCanvas.getContext('2d');
+
+        const binaryGlyphs = "010101100101010101110010101101";
+        const colCount = 150;
+        const colSpacing = mCanvas.width / colCount;
+        const mCols = Array.from({ length: colCount }, () => Math.floor(Math.random() * -80));
+        let matrixActive = false;
+        let lastMatrixDrawTime = 0;
+
+        const matrixTex = new THREE.CanvasTexture(mCanvas);
+        const matrixPlane = new THREE.Mesh(
+            new THREE.PlaneGeometry(10.5, 6.2),
+            new THREE.MeshBasicMaterial({
+                map: matrixTex,
+                transparent: true,
+                opacity: 0.45,
+                blending: THREE.AdditiveBlending,
+                depthWrite: false
+            })
+        );
+        matrixPlane.position.set(0, 1.45, -3.8);
+        matrixPlane.visible = false;
+        scene.add(matrixPlane);
+
+        function drawMatrixRain(nowTime) {
+            if (!matrixActive) return;
+            if (nowTime - lastMatrixDrawTime < 35) return;
+            lastMatrixDrawTime = nowTime;
+
+            mCtx.fillStyle = 'rgba(0, 0, 0, 0.25)';
+            mCtx.fillRect(0, 0, mCanvas.width, mCanvas.height);
+            mCtx.font = 'bold 9px "Consolas", monospace';
+
+            for (let i = 0; i < mCols.length; i++) {
+                const char = binaryGlyphs[Math.floor(Math.random() * binaryGlyphs.length)];
+                const x = i * colSpacing;
+                const y = mCols[i] * 12;
+
+                mCtx.fillStyle = '#CCFFDD';
+                mCtx.fillText(char, x, y);
+                mCtx.fillStyle = '#00AA33';
+                const prevChar = binaryGlyphs[Math.floor(Math.random() * binaryGlyphs.length)];
+                mCtx.fillText(prevChar, x, y - 12);
+
+                if (y > mCanvas.height && Math.random() > 0.982) mCols[i] = 0;
+                mCols[i]++;
+            }
+            matrixTex.needsUpdate = true;
+        }
+
+        // ── 3D MODEL BONE ARCHITECTURE & CALIBRATED POSTURE ───────────────────
+        let avatarModel = null, morphMeshes = [], jawBone = null;
+        const boneRestQuats = new Map();
+        
+        const avatarBones = { 
+            neck: null,
+            head: null, 
+            leftEye: null, 
+            rightEye: null, 
+            spine: null, 
+            leftShoulder: null, 
+            rightShoulder: null, 
+            leftUpperArm: null, 
+            rightUpperArm: null 
+        };
+
+        // Calibrated baseline rest pitch (maintains natural, level chin posture)
+        const REST_HEAD_PITCH = 4.8;
+
+        let targetEyeX = 0, targetEyeY = 0, currentEyeX = 0, currentEyeY = 0;
+        let targetHeadYaw = 0, targetHeadPitch = 0, currentHeadYaw = 0, currentHeadPitch = REST_HEAD_PITCH;
+
+        let enableEyeTracking = false;
+        let enableHeadTracking = false;
+        let faceMesh = null, webcamCamera = null, trackingActive = false;
+
+        function initMediaPipe() {
+            if (!faceMesh) {
+                faceMesh = new FaceMesh({
+                    locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/face_mesh/${file}`
+                });
+                faceMesh.setOptions({
+                    maxNumFaces: 1,
+                    refineLandmarks: true, // Enables iris tracking landmarks 468-477
+                    minDetectionConfidence: 0.5,
+                    minTrackingConfidence: 0.5
+                });
+                faceMesh.onResults((results) => {
+                    if (results.multiFaceLandmarks && results.multiFaceLandmarks.length > 0) {
+                        const lm = results.multiFaceLandmarks[0];
+                        // 1. Head orientation from nose bridge
+                        const nose = lm[1];
+                        targetHeadYaw = (nose.x - 0.5) * -50.0;
+                        targetHeadPitch = (nose.y - 0.5) * 32.0;
+
+                        // 2. Eye Gaze orientation from sub-millimeter Iris
+                        if (lm.length >= 478) {
+                            const lIris = lm[468], lOuter = lm[33], lInner = lm[133];
+                            const lWidth = Math.max(0.01, Math.abs(lInner.x - lOuter.x));
+                            const lGazeX = ((lIris.x - lOuter.x) / lWidth - 0.5) * -2.2;
+
+                            const rIris = lm[473], rInner = lm[362], rOuter = lm[263];
+                            const rWidth = Math.max(0.01, Math.abs(rOuter.x - rInner.x));
+                            const rGazeX = ((rIris.x - rInner.x) / rWidth - 0.5) * -2.2;
+
+                            targetEyeX = (lGazeX + rGazeX) * 0.5;
+
+                            const eyeCenterY = (lOuter.y + lInner.y + rInner.y + rOuter.y) * 0.25;
+                            const eyeDist = (lWidth + rWidth) * 0.5;
+                            targetEyeY = ((lIris.y + rIris.y) * 0.5 - eyeCenterY) / (eyeDist * 0.45);
+                        }
+                    }
+                });
+            }
+        }
+
+        function checkCameraState() {
+            const videoElement = document.getElementById('webcam-video');
+            const shouldRun = enableEyeTracking || enableHeadTracking;
+
+            if (shouldRun && !trackingActive) {
+                trackingActive = true;
+                initMediaPipe();
+                if (!webcamCamera && videoElement) {
+                    webcamCamera = new Camera(videoElement, {
+                        onFrame: async () => {
+                            if (trackingActive && faceMesh) {
+                                try { await faceMesh.send({ image: videoElement }); } catch(e){}
+                            }
+                        },
+                        width: 320,
+                        height: 240
+                    });
+                }
+                if (webcamCamera) webcamCamera.start();
+            } else if (!shouldRun && trackingActive) {
+                trackingActive = false;
+                if (webcamCamera) {
+                    try { webcamCamera.stop(); } catch(e){}
+                }
+                targetHeadYaw = 0;
+                targetHeadPitch = 0;
+                targetEyeX = 0;
+                targetEyeY = 0;
+            }
+        }
+
+        function toggleEyeTracking(forceState = null) {
+            enableEyeTracking = forceState !== null ? forceState : !enableEyeTracking;
+            checkCameraState();
+            return enableEyeTracking;
+        }
+
+        function toggleHeadTracking(forceState = null) {
+            enableHeadTracking = forceState !== null ? forceState : !enableHeadTracking;
+            checkCameraState();
+            return enableHeadTracking;
+        }
+		
+		// ── NEXUS CINEMATIC PRODUCTION AUDIO ENGINE (EVERY BUTTON UNIQUE) ────
+        const NexusSFX = (() => {
+            let ctx = null, masterComp = null, masterGain = null, spatialDelay = null, delayGain = null;
+
+            function initAudio() {
+                if (!ctx) {
+                    ctx = new (window.AudioContext || window.webkitAudioContext)();
+
+                    masterComp = ctx.createDynamicsCompressor();
+                    masterComp.threshold.setValueAtTime(-14, ctx.currentTime);
+                    masterComp.knee.setValueAtTime(6, ctx.currentTime);
+                    masterComp.ratio.setValueAtTime(10, ctx.currentTime);
+                    masterComp.attack.setValueAtTime(0.002, ctx.currentTime);
+                    masterComp.release.setValueAtTime(0.18, ctx.currentTime);
+
+                    masterGain = ctx.createGain();
+                    masterGain.gain.setValueAtTime(1.6, ctx.currentTime);
+
+                    spatialDelay = ctx.createDelay();
+                    spatialDelay.delayTime.setValueAtTime(0.09, ctx.currentTime);
+
+                    delayGain = ctx.createGain();
+                    delayGain.gain.setValueAtTime(0.22, ctx.currentTime);
+
+                    spatialDelay.connect(delayGain);
+                    delayGain.connect(masterComp);
+                    masterComp.connect(masterGain);
+                    masterGain.connect(ctx.destination);
+                }
+                if (ctx.state === 'suspended') ctx.resume();
+                return ctx;
+            }
+
+            function getMasterBus(withEcho = true) {
+                initAudio();
+                const node = ctx.createGain();
+                node.connect(masterComp);
+                if (withEcho) node.connect(spatialDelay);
+                return node;
+            }
+
+            function subDrop(t, bus, startF = 85, endF = 28, dur = 0.25, vol = 0.7) {
+                const osc = ctx.createOscillator(), g = ctx.createGain();
+                osc.type = 'sine';
+                osc.frequency.setValueAtTime(startF, t);
+                osc.frequency.exponentialRampToValueAtTime(endF, t + dur);
+                g.gain.setValueAtTime(vol, t);
+                g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+                osc.connect(g); g.connect(bus);
+                osc.start(t); osc.stop(t + dur);
+            }
+
+            function noiseHiss(t, bus, dur = 0.2, freq = 2400, vol = 0.4) {
+                const bSize = ctx.sampleRate * dur;
+                const b = ctx.createBuffer(1, bSize, ctx.sampleRate);
+                const d = b.getChannelData(0);
+                for (let i = 0; i < bSize; i++) d[i] = Math.random() * 2 - 1;
+                const n = ctx.createBufferSource(); n.buffer = b;
+                const f = ctx.createBiquadFilter(); f.type = 'bandpass';
+                f.frequency.setValueAtTime(freq, t);
+                f.frequency.exponentialRampToValueAtTime(400, t + dur);
+                const g = ctx.createGain();
+                g.gain.setValueAtTime(vol, t);
+                g.gain.exponentialRampToValueAtTime(0.001, t + dur);
+                n.connect(f); f.connect(g); g.connect(bus);
+                n.start(t);
+            }
+
+            function speakRobotic(phrase) {
+                if (!window.speechSynthesis) return;
+                window.speechSynthesis.cancel();
+                const utter = new SpeechSynthesisUtterance(phrase);
+                utter.rate = 1.05; utter.pitch = 0.55; utter.volume = 1.0;
+                const voices = window.speechSynthesis.getVoices();
+                const v = voices.find(x => x.name.includes("David") || x.name.includes("Mark") || x.name.includes("Google US English") || x.lang.startsWith("en"));
+                if (v) utter.voice = v;
+                window.speechSynthesis.speak(utter);
+            }
+
+            return {
+                // 1. TABS NAVIGATION SOUNDS
+                nav_home: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus();
+                    subDrop(now, bus, 75, 30, 0.35, 0.7);
+                    [440, 880].forEach((f, i) => {
+                        const o = c.createOscillator(), g = c.createGain();
+                        o.type = 'sine'; o.frequency.setValueAtTime(f, now + i * 0.08);
+                        g.gain.setValueAtTime(0.3, now + i * 0.08);
+                        g.gain.exponentialRampToValueAtTime(0.001, now + i * 0.08 + 0.2);
+                        o.connect(g); g.connect(bus);
+                        o.start(now + i * 0.08); o.stop(now + i * 0.08 + 0.2);
+                    });
+                },
+
+                nav_chat: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus();
+                    [1200, 1850].forEach((f, i) => {
+                        const o = c.createOscillator(), g = c.createGain();
+                        o.type = 'triangle'; o.frequency.setValueAtTime(f, now + i * 0.05);
+                        g.gain.setValueAtTime(0.35, now + i * 0.05);
+                        g.gain.exponentialRampToValueAtTime(0.001, now + i * 0.05 + 0.12);
+                        o.connect(g); g.connect(bus);
+                        o.start(now + i * 0.05); o.stop(now + i * 0.05 + 0.12);
+                    });
+                },
+
+                nav_news: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus();
+                    [880, 1100, 1320].forEach((f, i) => {
+                        const o = c.createOscillator(), g = c.createGain();
+                        o.type = 'sine'; o.frequency.setValueAtTime(f, now + i * 0.04);
+                        g.gain.setValueAtTime(0.3, now + i * 0.04);
+                        g.gain.exponentialRampToValueAtTime(0.001, now + i * 0.04 + 0.09);
+                        o.connect(g); g.connect(bus);
+                        o.start(now + i * 0.04); o.stop(now + i * 0.04 + 0.09);
+                    });
+                },
+
+                nav_plugins: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus(false);
+                    [0, 0.035].forEach(d => {
+                        const o = c.createOscillator(), g = c.createGain();
+                        o.type = 'sawtooth'; o.frequency.setValueAtTime(420, now + d);
+                        o.frequency.exponentialRampToValueAtTime(120, now + d + 0.04);
+                        g.gain.setValueAtTime(0.35, now + d);
+                        g.gain.exponentialRampToValueAtTime(0.001, now + d + 0.04);
+                        o.connect(g); g.connect(bus);
+                        o.start(now + d); o.stop(now + d + 0.04);
+                    });
+                    setTimeout(() => subDrop(c.currentTime, bus, 140, 40, 0.18, 0.6), 80);
+                },
+
+                nav_upload: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus();
+                    noiseHiss(now, bus, 0.22, 3800, 0.45);
+                    const o = c.createOscillator(), g = c.createGain();
+                    o.type = 'triangle'; o.frequency.setValueAtTime(300, now);
+                    o.frequency.exponentialRampToValueAtTime(950, now + 0.18);
+                    g.gain.setValueAtTime(0.3, now);
+                    g.gain.exponentialRampToValueAtTime(0.001, now + 0.2);
+                    o.connect(g); g.connect(bus);
+                    o.start(now); o.stop(now + 0.2);
+                },
+
+                nav_settings: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus(false);
+                    [0, 0.02, 0.04].forEach(d => {
+                        const o = c.createOscillator(), g = c.createGain();
+                        o.type = 'square'; o.frequency.setValueAtTime(1800, now + d);
+                        o.frequency.exponentialRampToValueAtTime(3200, now + d + 0.015);
+                        g.gain.setValueAtTime(0.25, now + d);
+                        g.gain.exponentialRampToValueAtTime(0.001, now + d + 0.015);
+                        o.connect(g); g.connect(bus);
+                        o.start(now + d); o.stop(now + d + 0.015);
+                    });
+                },
+				
+				// High-Voltage Hardware Telemetry Diagnostic Sweep
+                nav_metrics: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus();
+                    subDrop(now, bus, 140, 45, 0.28, 0.85);
+
+                    // High-frequency dual-frequency diagnostics chirp
+                    [640, 1280].forEach((freq, idx) => {
+                        const osc = c.createOscillator(), g = c.createGain();
+                        osc.type = 'triangle';
+                        osc.frequency.setValueAtTime(freq, now + idx * 0.06);
+                        osc.frequency.exponentialRampToValueAtTime(freq * 1.8, now + idx * 0.06 + 0.12);
+                        g.gain.setValueAtTime(0.35, now + idx * 0.06);
+                        g.gain.exponentialRampToValueAtTime(0.001, now + idx * 0.06 + 0.14);
+                        osc.connect(g); g.connect(bus);
+                        osc.start(now + idx * 0.06); osc.stop(now + idx * 0.06 + 0.14);
+                    });
+                },
+
+                // 2. BACK TO CORE SOUND
+                back_to_core: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus();
+                    const whoosh = c.createOscillator(), gW = c.createGain();
+                    whoosh.type = 'sine'; whoosh.frequency.setValueAtTime(200, now);
+                    whoosh.frequency.exponentialRampToValueAtTime(850, now + 0.15);
+                    gW.gain.setValueAtTime(0.25, now);
+                    gW.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
+                    whoosh.connect(gW); gW.connect(bus);
+                    whoosh.start(now); whoosh.stop(now + 0.18);
+
+                    setTimeout(() => {
+                        subDrop(c.currentTime, bus, 130, 30, 0.3, 0.85);
+                        noiseHiss(c.currentTime, bus, 0.12, 1800, 0.35);
+                    }, 140);
+                },
+
+                // 3. EYE TRACKING: DISTINCT ON vs OFF
+                eye_on: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus();
+                    const o = c.createOscillator(), g = c.createGain();
+                    o.type = 'sine'; o.frequency.setValueAtTime(500, now);
+                    o.frequency.exponentialRampToValueAtTime(1600, now + 0.22);
+                    g.gain.setValueAtTime(0.35, now);
+                    g.gain.exponentialRampToValueAtTime(0.001, now + 0.24);
+                    o.connect(g); g.connect(bus);
+                    o.start(now); o.stop(now + 0.24);
+                    noiseHiss(now, bus, 0.15, 3200, 0.35);
+                },
+
+                eye_off: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus(false);
+                    const o = c.createOscillator(), g = c.createGain();
+                    o.type = 'sawtooth'; o.frequency.setValueAtTime(1200, now);
+                    o.frequency.exponentialRampToValueAtTime(180, now + 0.08);
+                    g.gain.setValueAtTime(0.4, now);
+                    g.gain.exponentialRampToValueAtTime(0.001, now + 0.08);
+                    o.connect(g); g.connect(bus);
+                    o.start(now); o.stop(now + 0.08);
+                    subDrop(now, bus, 110, 45, 0.15, 0.6);
+                },
+
+                // 4. HEAD TRACKING: DISTINCT ON vs OFF
+                head_on: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus();
+                    const o = c.createOscillator(), g = c.createGain();
+                    o.type = 'triangle'; o.frequency.setValueAtTime(220, now);
+                    o.frequency.exponentialRampToValueAtTime(900, now + 0.28);
+                    g.gain.setValueAtTime(0.35, now);
+                    g.gain.exponentialRampToValueAtTime(0.001, now + 0.30);
+                    o.connect(g); g.connect(bus);
+                    o.start(now); o.stop(now + 0.30);
+                },
+
+                head_off: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus(false);
+                    const o = c.createOscillator(), g = c.createGain();
+                    o.type = 'triangle'; o.frequency.setValueAtTime(800, now);
+                    o.frequency.exponentialRampToValueAtTime(140, now + 0.18);
+                    g.gain.setValueAtTime(0.35, now);
+                    g.gain.exponentialRampToValueAtTime(0.001, now + 0.20);
+                    o.connect(g); g.connect(bus);
+                    o.start(now); o.stop(now + 0.20);
+                    setTimeout(() => subDrop(c.currentTime, bus, 90, 25, 0.18, 0.5), 120);
+                },
+
+                // 5. MATRIX RAIN: DISTINCT ON vs OFF
+                matrix_on: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus();
+                    const o = c.createOscillator(), g = c.createGain();
+                    o.type = 'sawtooth'; o.frequency.setValueAtTime(180, now);
+                    o.frequency.exponentialRampToValueAtTime(1400, now + 0.35);
+                    const f = c.createBiquadFilter(); f.type = 'bandpass';
+                    f.frequency.setValueAtTime(1200, now);
+                    g.gain.setValueAtTime(0.35, now);
+                    g.gain.exponentialRampToValueAtTime(0.001, now + 0.38);
+                    o.connect(f); f.connect(g); g.connect(bus);
+                    o.start(now); o.stop(now + 0.38);
+                },
+
+                matrix_off: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus(false);
+                    subDrop(now, bus, 160, 20, 0.35, 0.75);
+                    noiseHiss(now, bus, 0.18, 1200, 0.25);
+                },
+
+                // 6. EMERGENCY ABORT / STOP BUTTON
+                abort_stop: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus();
+                    subDrop(now, bus, 140, 20, 0.35, 0.95);
+                    [880, 440].forEach((f, i) => {
+                        const o = c.createOscillator(), g = c.createGain();
+                        o.type = 'sawtooth'; o.frequency.setValueAtTime(f, now + i * 0.08);
+                        g.gain.setValueAtTime(0.4, now + i * 0.08);
+                        g.gain.exponentialRampToValueAtTime(0.001, now + i * 0.08 + 0.15);
+                        o.connect(g); g.connect(bus);
+                        o.start(now + i * 0.08); o.stop(now + i * 0.08 + 0.15);
+                    });
+                },
+
+                // 7. QUICK ACTIONS (EACH UNIQUE)
+                action_image: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus();
+                    const o = c.createOscillator(), g = c.createGain();
+                    o.type = 'sine'; o.frequency.setValueAtTime(400, now);
+                    o.frequency.exponentialRampToValueAtTime(2200, now + 0.16);
+                    g.gain.setValueAtTime(0.3, now);
+                    g.gain.exponentialRampToValueAtTime(0.001, now + 0.18);
+                    o.connect(g); g.connect(bus);
+                    o.start(now); o.stop(now + 0.18);
+                    setTimeout(() => noiseHiss(c.currentTime, bus, 0.12, 3600, 0.45), 150);
+                },
+
+                action_app: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus();
+                    subDrop(now, bus, 120, 40, 0.22, 0.8);
+                    const o = c.createOscillator(), g = c.createGain();
+                    o.type = 'triangle'; o.frequency.setValueAtTime(650, now);
+                    o.frequency.exponentialRampToValueAtTime(1400, now + 0.14);
+                    g.gain.setValueAtTime(0.35, now);
+                    g.gain.exponentialRampToValueAtTime(0.001, now + 0.16);
+                    o.connect(g); g.connect(bus);
+                    o.start(now); o.stop(now + 0.16);
+                },
+
+                action_search: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus();
+                    const o = c.createOscillator(), g = c.createGain();
+                    o.type = 'sine'; o.frequency.setValueAtTime(1400, now);
+                    g.gain.setValueAtTime(0.45, now);
+                    g.gain.exponentialRampToValueAtTime(0.001, now + 0.45);
+                    o.connect(g); g.connect(bus);
+                    o.start(now); o.stop(now + 0.45);
+                },
+
+                action_task: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus(false);
+                    subDrop(now, bus, 110, 35, 0.16, 0.6);
+                    const o = c.createOscillator(), g = c.createGain();
+                    o.type = 'square'; o.frequency.setValueAtTime(980, now);
+                    o.frequency.exponentialRampToValueAtTime(320, now + 0.08);
+                    g.gain.setValueAtTime(0.3, now);
+                    g.gain.exponentialRampToValueAtTime(0.001, now + 0.08);
+                    o.connect(g); g.connect(bus);
+                    o.start(now); o.stop(now + 0.08);
+                },
+
+                // 8. MIC ON / OFF & SEND (SOUND ONLY - NO SPEECH)
+                mic_on: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus();
+                    subDrop(now, bus, 45, 120, 0.65, 0.9);
+                    const turbine = c.createOscillator(), turbineG = c.createGain();
+                    turbine.type = 'sine'; turbine.frequency.setValueAtTime(220, now);
+                    turbine.frequency.exponentialRampToValueAtTime(1850, now + 0.60);
+                    turbineG.gain.setValueAtTime(0.35, now);
+                    turbineG.gain.exponentialRampToValueAtTime(0.001, now + 0.65);
+                    turbine.connect(turbineG); turbineG.connect(bus);
+                    turbine.start(now); turbine.stop(now + 0.65);
+
+                    [0.10, 0.22, 0.36].forEach((delay, i) => {
+                        const freqs = [523.25, 783.99, 1318.51];
+                        const chord = c.createOscillator(), chordG = c.createGain();
+                        chord.type = 'triangle'; chord.frequency.setValueAtTime(freqs[i], now + delay);
+                        chordG.gain.setValueAtTime(0.4, now + delay);
+                        chordG.gain.exponentialRampToValueAtTime(0.001, now + delay + 0.45);
+                        chord.connect(chordG); chordG.connect(bus);
+                        chord.start(now + delay); chord.stop(now + delay + 0.45);
+                    });
+                    setTimeout(() => noiseHiss(c.currentTime, bus, 0.35, 3200), 400);
+                },
+
+                mic_off: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus();
+                    noiseHiss(now, bus, 0.55, 1600);
+                    const osc = c.createOscillator(), g = c.createGain();
+                    osc.type = 'sawtooth'; osc.frequency.setValueAtTime(1200, now);
+                    osc.frequency.exponentialRampToValueAtTime(45, now + 0.70);
+                    const f = c.createBiquadFilter(); f.type = 'lowpass';
+                    f.frequency.setValueAtTime(2400, now);
+                    f.frequency.linearRampToValueAtTime(120, now + 0.70);
+                    g.gain.setValueAtTime(0.4, now);
+                    g.gain.exponentialRampToValueAtTime(0.001, now + 0.75);
+                    osc.connect(f); f.connect(g); g.connect(bus);
+                    osc.start(now); osc.stop(now + 0.75);
+                    setTimeout(() => subDrop(c.currentTime, bus, 110, 20, 0.35, 0.8), 280);
+                },
+
+                send: function() {
+                    const c = initAudio(), now = c.currentTime, bus = getMasterBus();
+                    subDrop(now, bus, 120, 45, 0.16, 0.6);
+                    const osc = c.createOscillator(), g = c.createGain();
+                    osc.type = 'sine'; osc.frequency.setValueAtTime(740, now);
+                    osc.frequency.exponentialRampToValueAtTime(2400, now + 0.18);
+                    g.gain.setValueAtTime(0.45, now);
+                    g.gain.exponentialRampToValueAtTime(0.001, now + 0.22);
+                    osc.connect(g); g.connect(bus);
+                    osc.start(now); osc.stop(now + 0.22);
+                }
+            };
+        })();
+
+        window.NexusSFX = NexusSFX;
+
+        // ── NEXUS CORE BRIDGE (Connects UI.py speaking, lip-sync & controls) ──
+        window.NexusCore = {
+            pulseSpeech: () => triggerSpeechPulse(),
+            pulseUserSpeech: () => triggerUserSpeechPulse(),
+            setUserSpeaking: (state) => setUserSpeakingDirect(Boolean(state)),
+            setLiveSpeaking: (state) => setAISpeakingDirect(Boolean(state)),
+            setAudioEnergy: (level) => setAudioEnergyLevel(Number(level) || 0),
+            toggleEyeTracking: (forceState = null) => toggleEyeTracking(forceState),
+            toggleHeadTracking: (forceState = null) => toggleHeadTracking(forceState),
+            toggleTracking: (forceState = null) => {
+                const s = forceState !== null ? forceState : (!enableEyeTracking || !enableHeadTracking);
+                toggleEyeTracking(s);
+                toggleHeadTracking(s);
+                return s;
+            },
+            pauseCamera: () => {
+                if (webcamCamera) { try { webcamCamera.stop(); } catch(e){} }
+            },
+            resumeCamera: () => {
+                if (enableEyeTracking || enableHeadTracking) checkCameraState();
+            },
+            toggleMatrixRain: function() {
+                matrixActive = !matrixActive;
+                matrixPlane.visible = matrixActive;
+                if (matrixActive) {
+                    mCtx.fillStyle = '#000000';
+                    mCtx.fillRect(0, 0, mCanvas.width, mCanvas.height);
+                }
+                return matrixActive;
+            }
+        };
+
+        const loader = new THREE.GLTFLoader();
+        loader.load('./head.glb', function (gltf) {
+            avatarModel = gltf.scene; 
+            avatarModel.position.set(0, 0, 0); 
+            scene.add(avatarModel);
+
+            avatarModel.traverse((child) => {
+                if (child.morphTargetDictionary && child.morphTargetInfluences) {
+                    morphMeshes.push(child);
+                }
+
+                const name = child.name.toLowerCase();
+
+                // 1. Detect Eye Nodes
+                const isLeftEye = name.includes('lefteye') || (name.includes('eye') && (name.includes('left') || name.includes('_l') || name.includes('.l')));
+                const isRightEye = name.includes('righteye') || (name.includes('eye') && (name.includes('right') || name.includes('_r') || name.includes('.r')));
+
+                if (isLeftEye && !avatarBones.leftEye) {
+                    avatarBones.leftEye = child;
+                    boneRestQuats.set(child, child.quaternion.clone());
+                } else if (isRightEye && !avatarBones.rightEye) {
+                    avatarBones.rightEye = child;
+                    boneRestQuats.set(child, child.quaternion.clone());
+                }
+
+                // 2. Detect Skeletal Bones (Arms, Shoulders, Spine, Head)
+                if (child.isBone) {
+                    boneRestQuats.set(child, child.quaternion.clone());
+
+                    const isLeft = name.includes('left') || name.includes('_l') || name.includes('.l');
+                    const isRight = name.includes('right') || name.includes('_r') || name.includes('.r');
+
+                    if (name.includes('neck') && !avatarBones.neck) {
+                        avatarBones.neck = child;
+                    } else if (name.includes('head') && !avatarBones.head) {
+                        avatarBones.head = child;
+                    } else if ((name.includes('spine') || name.includes('chest')) && !avatarBones.spine) {
+                        avatarBones.spine = child;
+                    } else if (isLeft && (name.includes('shoulder') || name.includes('clavicle')) && !avatarBones.leftShoulder) {
+                        avatarBones.leftShoulder = child;
+                    } else if (isRight && (name.includes('shoulder') || name.includes('clavicle')) && !avatarBones.rightShoulder) {
+                        avatarBones.rightShoulder = child;
+                    } else if (isLeft && (name.includes('arm') || name.includes('upperarm')) && !name.includes('forearm') && !name.includes('hand') && !avatarBones.leftUpperArm) {
+                        avatarBones.leftUpperArm = child;
+                    } else if (isRight && (name.includes('arm') || name.includes('upperarm')) && !name.includes('forearm') && !name.includes('hand') && !avatarBones.rightUpperArm) {
+                        avatarBones.rightUpperArm = child;
+                    } else if (name.includes('jaw')) {
+                        jawBone = child;
+                    }
+                }
+            });
+
+            // Immediately pulls arms down using your exact BAKED_CONFIG coordinates
+            applyPermanentPose();
+        });
+
+        function applyPermanentPose() {
+            if (!avatarModel) return;
+            const rArmX = THREE.MathUtils.degToRad(BAKED_CONFIG.arm.x);
+            const rArmY = THREE.MathUtils.degToRad(BAKED_CONFIG.arm.y);
+            const rArmZ = THREE.MathUtils.degToRad(BAKED_CONFIG.arm.z);
+            const rShX = THREE.MathUtils.degToRad(BAKED_CONFIG.shoulder.x);
+            const rShY = THREE.MathUtils.degToRad(BAKED_CONFIG.shoulder.y);
+            const rShZ = THREE.MathUtils.degToRad(BAKED_CONFIG.shoulder.z);
+
+            if (avatarBones.leftUpperArm && boneRestQuats.has(avatarBones.leftUpperArm)) {
+                avatarBones.leftUpperArm.quaternion.copy(boneRestQuats.get(avatarBones.leftUpperArm))
+                    .multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(rArmX, rArmY, rArmZ, 'XYZ')));
+            }
+            if (avatarBones.rightUpperArm && boneRestQuats.has(avatarBones.rightUpperArm)) {
+                avatarBones.rightUpperArm.quaternion.copy(boneRestQuats.get(avatarBones.rightUpperArm))
+                    .multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(rArmX, -rArmY, -rArmZ, 'XYZ')));
+            }
+            if (avatarBones.leftShoulder && boneRestQuats.has(avatarBones.leftShoulder)) {
+                avatarBones.leftShoulder.quaternion.copy(boneRestQuats.get(avatarBones.leftShoulder))
+                    .multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(rShX, rShY, rShZ, 'XYZ')));
+            }
+            if (avatarBones.rightShoulder && boneRestQuats.has(avatarBones.rightShoulder)) {
+                avatarBones.rightShoulder.quaternion.copy(boneRestQuats.get(avatarBones.rightShoulder))
+                    .multiply(new THREE.Quaternion().setFromEuler(new THREE.Euler(rShX, -rShY, -rShZ, 'XYZ')));
+            }
+        }
+
+        // Anti-Vibration Async Lock
+        let isSyncing = false;
+
+        async function syncWithPythonGaze() {
+            if (isSyncing) return;
+            if (window.pywebview && window.pywebview.api) {
+                isSyncing = true;
+                try {
+                    const state = await window.pywebview.api.get_state();
+
+                    targetEyeX = state.eye_x;
+                    targetEyeY = state.eye_y;
+
+                    targetHeadYaw = state.head_yaw !== undefined ? state.head_yaw : (state.head_x || 0.0);
+                    targetHeadPitch = state.head_pitch !== undefined ? state.head_pitch : (state.head_y || 0.0);
+
+                    if (state.is_speaking) triggerSpeechPulse();
+                    if (state.audio_level > 0.02) setAudioEnergyLevel(state.audio_level);
+                } catch(e) {}
+                finally {
+                    isSyncing = false;
+                }
+            }
+        }
+
+        function updateLipSyncAndEyelids(time, energyLevel, eyePitchRad) {
+            const isSilent = energyLevel < 0.015;
+            const syllableWave = (Math.sin(time * 20.0) * 0.4 + 0.6) * Math.abs(Math.sin(time * 10.0));
+            const widthWave = Math.cos(time * 13.0) * 0.3 + 0.7;
+
+            const jawVal = isSilent ? 0.0 : syllableWave * energyLevel * 0.28;
+            const visemeAaVal = isSilent ? 0.0 : syllableWave * widthWave * energyLevel * 0.32;
+            const visemeOVal = isSilent ? 0.0 : (Math.sin(time * 8.0) * 0.5 + 0.5) * energyLevel * 0.26;
+            const visemeEVal = isSilent ? 0.0 : widthWave * energyLevel * 0.22;
+
+            const timeInCycle = time % 4.5;
+            let blinkVal = timeInCycle < 0.18 ? Math.sin((timeInCycle / 0.18) * Math.PI) : 0.0;
+
+            // Dynamic eyelid follow-through for downward gaze
+            if (enableEyeTracking && eyePitchRad > 0.0) {
+                const eyelidFollow = Math.min(0.48, (eyePitchRad / 0.32) * 0.45);
+                blinkVal = Math.max(blinkVal, eyelidFollow);
+            }
+            // Resting eye relaxation: prevents wide-eyed stare
+            blinkVal = Math.max(blinkVal, 0.07);
+
+            for (let m = 0; m < morphMeshes.length; m++) {
+                const dict = morphMeshes[m].morphTargetDictionary, influences = morphMeshes[m].morphTargetInfluences;
+                if (!dict || !influences) continue;
+                for (let name in dict) {
+                    const low = name.toLowerCase(), idx = dict[name];
+                    if (low.includes('eyeblink') || low.includes('blink')) influences[idx] = blinkVal;
+                    else if (low.includes('jawopen') || low.includes('mouthopen')) influences[idx] = jawVal;
+                    else if (low.includes('viseme_aa') || low.includes('viseme_a')) influences[idx] = visemeAaVal;
+                    else if (low.includes('viseme_o') || low.includes('mouthpucker')) influences[idx] = visemeOVal;
+                    else if (low.includes('viseme_e') || low.includes('viseme_i')) influences[idx] = visemeEVal;
+                }
+            }
+
+            if (jawBone && boneRestQuats.has(jawBone)) {
+                if (isSilent) {
+                    jawBone.quaternion.copy(boneRestQuats.get(jawBone));
+                } else {
+                    jawBone.quaternion.copy(boneRestQuats.get(jawBone)).multiply(new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(1, 0, 0), jawVal * 0.15));
+                }
+            }
+        }
+
+        window.addEventListener('resize', () => {
+            camera.aspect = window.innerWidth / window.innerHeight;
+            camera.updateProjectionMatrix();
+            renderer.setSize(window.innerWidth, window.innerHeight);
+        });
+
+        function animate() {
+            requestAnimationFrame(animate);
+            const elapsedTime = clock.getElapsedTime();
+            const nowTime = performance.now();
+
+            syncWithPythonGaze();
+
+            // ── BODY STABILITY GUARANTEE ───────────────────────────────────────
+            if (avatarModel) {
+                avatarModel.rotation.set(0, 0, 0);
+            }
+
+            // ── 1. HEAD & NECK TRACKING (WITH CALIBRATED REST POSTURE) ──────────
+            if (enableHeadTracking) {
+                currentHeadYaw += (targetHeadYaw - currentHeadYaw) * 0.10;
+                const desiredPitch = REST_HEAD_PITCH + targetHeadPitch;
+                currentHeadPitch += (desiredPitch - currentHeadPitch) * 0.10;
+            } else {
+                currentHeadYaw += (0.0 - currentHeadYaw) * 0.08;
+                currentHeadPitch += (REST_HEAD_PITCH - currentHeadPitch) * 0.08;
+            }
+
+            const yawRad = THREE.MathUtils.degToRad(currentHeadYaw);
+            const pitchRad = THREE.MathUtils.degToRad(currentHeadPitch);
+
+            if (avatarBones.neck && boneRestQuats.has(avatarBones.neck)) {
+                const neckQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(pitchRad * 0.25, yawRad * 0.30, 0, 'YXZ'));
+                avatarBones.neck.quaternion.copy(boneRestQuats.get(avatarBones.neck)).multiply(neckQuat);
+            }
+
+            if (avatarBones.head && boneRestQuats.has(avatarBones.head)) {
+                const headMult = avatarBones.neck ? 0.70 : 1.0;
+                const headPitchMult = avatarBones.neck ? 0.75 : 1.0;
+                const headQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(pitchRad * headPitchMult, yawRad * headMult, 0, 'YXZ'));
+                avatarBones.head.quaternion.copy(boneRestQuats.get(avatarBones.head)).multiply(headQuat);
+            }
+
+            // ── 2. TUNED EYE TRACKING (CRISP & ANATOMICALLY CLAMPED) ───────────
+            if (enableEyeTracking) {
+                currentEyeX += (targetEyeX - currentEyeX) * 0.25;
+                currentEyeY += (targetEyeY - currentEyeY) * 0.25;
+            } else {
+                currentEyeX += (0.0 - currentEyeX) * 0.15;
+                currentEyeY += (0.0 - currentEyeY) * 0.15;
+            }
+
+            const EYE_GAIN_X = 1.45;
+            const EYE_GAIN_Y = 1.35;
+            const MAX_EYE_YAW = 0.42;   // ±24 degrees max
+            const MAX_EYE_PITCH = 0.32; // ±18 degrees max
+
+            const eyeYawRad = THREE.MathUtils.clamp(currentEyeX * EYE_GAIN_X * MAX_EYE_YAW, -MAX_EYE_YAW, MAX_EYE_YAW);
+            const eyePitchRad = THREE.MathUtils.clamp(currentEyeY * EYE_GAIN_Y * MAX_EYE_PITCH, -MAX_EYE_PITCH, MAX_EYE_PITCH);
+
+            const eyeQuat = new THREE.Quaternion().setFromEuler(new THREE.Euler(eyePitchRad, eyeYawRad, 0, 'YXZ'));
+            if (avatarBones.leftEye && boneRestQuats.has(avatarBones.leftEye)) {
+                avatarBones.leftEye.quaternion.copy(boneRestQuats.get(avatarBones.leftEye)).multiply(eyeQuat);
+            }
+            if (avatarBones.rightEye && boneRestQuats.has(avatarBones.rightEye)) {
+                avatarBones.rightEye.quaternion.copy(boneRestQuats.get(avatarBones.rightEye)).multiply(eyeQuat);
+            }
+
+            // ── 3. SHADERS, LIGHTS & WATCHDOGS ─────────────────────────────────
+            const isAiTalking = (nowTime - lastSpeechPulseTime) < AI_WATCHDOG_TIMEOUT;
+            speechIntensity = THREE.MathUtils.lerp(speechIntensity, isAiTalking ? 1.0 : 0.0, isAiTalking ? 0.35 : 0.45);
+            if (speechIntensity < 0.01) speechIntensity = 0.0;
+
+            const isUserTalking = (nowTime - lastUserSpeechTime) < USER_WATCHDOG_TIMEOUT;
+            userSpeakingEnergy = THREE.MathUtils.lerp(userSpeakingEnergy, isUserTalking ? 1.0 : 0.0, isUserTalking ? 0.35 : 0.45);
+            if (userSpeakingEnergy < 0.01) userSpeakingEnergy = 0.0;
+
+            const combinedEnergy = Math.max(speechIntensity, userSpeakingEnergy);
+            const energyBoost = 1.0 + combinedEnergy * 3.0;
+
+            if (typeof orbRibbonMat !== 'undefined') {
+                orbRibbonMat.uniforms.time.value = elapsedTime;
+                orbRibbonMat.uniforms.energy.value = combinedEnergy;
+            }
+            if (typeof orbLineMat !== 'undefined') {
+                orbLineMat.uniforms.time.value = elapsedTime;
+                orbLineMat.uniforms.energy.value = combinedEnergy;
+            }
+            if (typeof glassMat !== 'undefined') {
+                glassMat.uniforms.time.value = elapsedTime;
+                glassMat.uniforms.energy.value = combinedEnergy;
+            }
+
+            if (typeof ribbonPoints !== 'undefined') {
+                ribbonPoints.rotation.y += 0.007 * energyBoost;
+                ribbonPoints.rotation.x += 0.004 * energyBoost;
+            }
+            if (typeof lineMesh !== 'undefined' && typeof ribbonPoints !== 'undefined') {
+                lineMesh.rotation.y = ribbonPoints.rotation.y;
+                lineMesh.rotation.x = ribbonPoints.rotation.x;
+            }
+            if (typeof glassMesh !== 'undefined') {
+                glassMesh.rotation.y -= 0.002;
+            }
+
+            const finalScale = 1.0 + Math.sin(elapsedTime * 2.5) * 0.02 + combinedEnergy * 0.12;
+            if (typeof orbGroup !== 'undefined') {
+                orbGroup.scale.set(finalScale, finalScale, finalScale);
+            }
+
+            if (matrixActive) {
+                targetAmbientColor.copy(MATRIX_GREEN_COLOR);
+            } else {
+                if (elapsedTime - lastColorSwitchTime >= 5.0) {
+                    activeColorIndex = (activeColorIndex + 1) % GOOGLE_COLORS.length;
+                    targetAmbientColor.copy(GOOGLE_COLORS[activeColorIndex]);
+                    lastColorSwitchTime = elapsedTime;
+                }
+            }
+            currentAmbientColor.lerp(targetAmbientColor, 0.025);
+
+            for (let i = 0; i < glowOrbs.length; i++) {
+                const orb = glowOrbs[i];
+                const cfg = orb.cfg;
+                orb.mesh.material.color.copy(currentAmbientColor);
+                orb.mesh.position.x = cfg.x + Math.sin(elapsedTime * cfg.speedX + cfg.phase) * 0.35;
+                orb.mesh.position.y = cfg.y + Math.cos(elapsedTime * cfg.speedY + cfg.phase) * 0.25;
+            }
+
+            if (typeof rimLight !== 'undefined') {
+                let rimTarget = (typeof matrixActive !== 'undefined' && matrixActive) 
+                    ? new THREE.Color(0x00FF66) 
+                    : new THREE.Color(0x90caf9);
+                rimLight.color.lerp(rimTarget, 0.05);
+                rimLight.intensity = (typeof matrixActive !== 'undefined' && matrixActive) ? 0.9 : 0.6;
+            }
+
+            let dynamicOrbColor = new THREE.Color(0x7c3aed);
+            if (userSpeakingEnergy > 0.05) dynamicOrbColor = new THREE.Color(0x00f2fe);
+            else if (speechIntensity > 0.05) dynamicOrbColor = new THREE.Color(0xd946ef);
+
+            if (typeof orbLight !== 'undefined') {
+                orbLight.color.lerp(dynamicOrbColor, 0.20);
+                orbLight.intensity = 1.4 + (combinedEnergy * 3.0);
+            }
+
+            drawMatrixRain(nowTime);
+            updateLipSyncAndEyelids(elapsedTime, speechIntensity, eyePitchRad);
+
+            controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+    </script>
+</body>
+</html>

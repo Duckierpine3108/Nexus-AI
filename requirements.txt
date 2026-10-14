@@ -1,0 +1,71 @@
+# NEXUS AI runtime and feature dependencies
+# Recommended build/test interpreter: 64-bit CPython 3.11 on Windows.
+
+# Desktop UI, avatar viewport, and audio
+PyQt6
+PyQt6-WebEngine
+sounddevice
+PyAudio
+numpy
+Pillow
+
+# Gemini Live API and legacy Google SDK compatibility
+google-genai>=2.8.0
+google-generativeai
+requests
+
+# Web search, browser automation, and video transcripts
+beautifulsoup4
+ddgs>=9.0.0
+playwright
+youtube-transcript-api
+
+# Desktop automation and system integration
+pyautogui
+pyperclip
+pygetwindow
+pywinauto
+psutil
+mss
+send2trash
+opencv-python
+
+# File processing: PDF, Office documents, spreadsheets, and audio
+pdfplumber
+PyPDF2
+python-docx
+pandas
+openpyxl
+pydub
+python-pptx
+
+# Remote dashboard and secure pairing
+fastapi
+uvicorn[standard]
+cryptography
+python-multipart
+qrcode[pil]
+
+# Cross-platform reminders and Windows integrations
+plyer
+pywebview
+WMI; sys_platform == "win32"
+comtypes; sys_platform == "win32"
+pycaw; sys_platform == "win32"
+win10toast; sys_platform == "win32"
+pywin32; sys_platform == "win32"
+
+# Optional live camera push-up pose detection and GPU telemetry
+mediapipe
+nvidia-ml-py
+
+# Optional offline speech recognition and speech synthesis
+faster-whisper
+torch
+vosk
+miniaudio
+edge-tts
+kokoro>=0.9
+
+# Build-time tool for freezing the application (Inno Setup is installed separately)
+pyinstaller

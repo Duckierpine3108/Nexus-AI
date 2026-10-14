@@ -1,0 +1,41 @@
+# Python Bytecode & Cache
+__pycache__
+.py[cod]
+$py.class
+.pyd
+
+# PyInstaller Build Artifacts (NEVER COMMIT)
+build
+dist
+Output
+.spec
+!nexus_ai.spec
+
+# Executables & Installers (Uploaded to GitHub Releases instead)
+.exe
+.msi
+
+# Local Configuration & Sensitive Credentials
+configapi_keys.json
+configsplash_session.lock
+configevolution_session.json
+configdevices_telemetry.json
+configuser_voiceprint.npy
+configcerts
+
+# Memory & Runtime Logs
+memorylong_term.json
+.log
+nexus_tree.txt
+nexus_structure.txt
+
+# Virtual Environments
+venv
+env
+ENV
+
+# IDE & OS Metadata
+.vscode
+.idea
+Thumbs.db
+Desktop.ini
