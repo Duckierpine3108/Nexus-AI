@@ -70,6 +70,9 @@ from actions.system_monitor    import SystemMonitor, get_system_status
 from actions.proactive         import ProactiveEngine
 from actions.deep_think        import deep_think
 from actions.device_tracker    import track_device
+from actions.tv_controller     import tv_controller
+from actions.codebase_inspector import codebase_inspector
+from actions.self_evolution    import self_evolution
 from actions.background_monitor import (
     add_monitor, remove_monitor, list_monitors, check_all as monitor_check_all,
 )
@@ -78,6 +81,40 @@ from memory.config_manager     import get_brief_enabled
 from core.plugin_loader        import discover_plugins
 # ── WhatsApp Controller Integration ──────────────────────────────────────────
 from actions.whatsapp_controller import whatsapp_agent
+import importlib
+
+# ── LIVE HOT-RELOAD TRACKER ──────────────────────────────────────────────────
+_ACTION_MTIMES: dict[str, float] = {}
+
+def dispatch_action(module_name: str, func_name: str, *args, **kwargs):
+    """
+    Dynamically loads and executes an action.
+    Checks the file's timestamp on disk before EVERY call.
+    If YOU or Nexus edited the file (Ctrl+S), it reloads into RAM live!
+    """
+    global _ACTION_MTIMES
+    mod_key = f"actions.{module_name}"
+    action_file = BASE_DIR / "actions" / f"{module_name}.py"
+
+    if action_file.exists():
+        current_mtime = action_file.stat().st_mtime
+        last_mtime = _ACTION_MTIMES.get(mod_key, 0.0)
+
+        # File was edited on disk -> Live Hot-Reload!
+        if current_mtime > last_mtime:
+            if mod_key in sys.modules:
+                try:
+                    importlib.reload(sys.modules[mod_key])
+                    print(f"\n[HotReload] ⚡ Detected edits in '{module_name}.py'! Hot-reloaded into RAM live.")
+                except Exception as rex:
+                    print(f"\n[HotReload] ⚠️ Error reloading {module_name}: {rex}")
+            else:
+                importlib.import_module(mod_key)
+            _ACTION_MTIMES[mod_key] = current_mtime
+
+    mod = sys.modules.get(mod_key) or importlib.import_module(mod_key)
+    func = getattr(mod, func_name)
+    return func(*args, **kwargs)
 
 def get_base_dir():
     if getattr(sys, "frozen", False):
@@ -204,28 +241,46 @@ TOOL_DECLARATIONS = [
     },
     {
         "name": "send_message",
-        "description": "Sends a text message via WhatsApp, Telegram, or other messaging platform.",
+        "description": (
+            "Sends a text message via Telegram, Discord, Signal, or other desktop apps. "
+            "IMPORTANT: Do NOT use this tool for WhatsApp. "
+            "For ANY WhatsApp request, always use whatsapp_message."
+        ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "receiver":     {"type": "STRING", "description": "Recipient contact name"},
+                "receiver":     {"type": "STRING", "description": "Recipient contact or channel name"},
                 "message_text": {"type": "STRING", "description": "The message to send"},
-                "platform":     {"type": "STRING", "description": "Platform: WhatsApp, Telegram, etc."}
+                "platform":     {"type": "STRING", "description": "Platform: Telegram, Discord, Signal, etc."}
             },
             "required": ["receiver", "message_text", "platform"]
         }
     },
     {
         "name": "reminder",
-        "description": "Sets a timed reminder using Task Scheduler.",
+        "description": (
+            "Sets an alarm, timer, or reminder. Triggers an on-screen popup card and plays the alarm sound when due. "
+            "Use for ANY timer, alarm, or reminder request, including exact times ('12:00', '10:31 PM', '22:31') "
+            "and relative durations ('10s', '10 seconds', '30s', '1 minute', '5m', '1 hour'). "
+            "Always call this tool immediately when user asks to set an alarm, reminder, or timer."
+        ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "date":    {"type": "STRING", "description": "Date in YYYY-MM-DD format"},
-                "time":    {"type": "STRING", "description": "Time in HH:MM format (24h)"},
-                "message": {"type": "STRING", "description": "Reminder message text"}
+                "time": {
+                    "type": "STRING",
+                    "description": "Duration or time. Examples: '10s', '30 seconds', '1m', '5 minutes', '1h', '10:31 PM', '22:31', '12:00'."
+                },
+                "message": {
+                    "type": "STRING",
+                    "description": "The reminder text or title (e.g. 'check the stove')."
+                },
+                "date": {
+                    "type": "STRING",
+                    "description": "Optional date ('today', 'tomorrow', 'YYYY-MM-DD'). Default is 'today'."
+                }
             },
-            "required": ["date", "time", "message"]
+            "required": ["time", "message"]
         }
     },
     {
@@ -292,24 +347,7 @@ TOOL_DECLARATIONS = [
         ),
         "parameters": {"type": "OBJECT", "properties": {}, "required": []}
     },
-    {
-        "name": "computer_settings",
-        "description": (
-            "Controls the computer: volume, brightness, window management, keyboard shortcuts, "
-            "typing text on screen, closing apps, fullscreen, dark mode, WiFi, restart, shutdown, "
-            "scrolling, tab management, zoom, screenshots, lock screen, refresh/reload page. "
-            "Use for ANY single computer control command."
-        ),
-        "parameters": {
-            "type": "OBJECT",
-            "properties": {
-                "action":      {"type": "STRING", "description": "The action to perform"},
-                "description": {"type": "STRING", "description": "Natural language description of what to do"},
-                "value":       {"type": "STRING", "description": "Optional value: volume level, text to type, etc."}
-            },
-            "required": []
-        }
-    },
+    
     {
         "name": "browser_control",
         "description": (
@@ -391,6 +429,39 @@ TOOL_DECLARATIONS = [
                 "timeout":     {"type": "INTEGER", "description": "Execution timeout in seconds (default: 30)"},
             },
             "required": ["action"]
+        }
+    },
+    {
+        "name": "self_evolution",
+        "description": (
+            "Safely edits and enhances Nexus AI's code files live with zero restart required.\n"
+            "RULES TO PREVENT TRUNCATION & BUGS:\n"
+            "- When adding a new function, ALWAYS use action='append_code'. NEVER rewrite the whole file with 'modify_file'!\n"
+            "- When editing an existing function, use action='patch_function' and specify 'function_name'.\n"
+            "- Only use 'modify_file' if you are completely rewriting a small file.\n"
+            "Actions: 'auto_repair' | 'search_and_replace' | 'patch_function' | 'append_code' | 'modify_file' | 'rollback' | 'list_backups'. ALWAYS prefer 'search_and_replace' for editing lines, or 'auto_repair' when fixing bugs. NEVER use modify_file on large files!"
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "append_code | patch_function | modify_file | rollback | list_backups"
+                },
+                "file_path": {
+                    "type": "STRING",
+                    "description": "Target file (e.g. 'actions/computer_settings.py')."
+                },
+                "code": {
+                    "type": "STRING",
+                    "description": "The function code to append or patch."
+                },
+                "function_name": {
+                    "type": "STRING",
+                    "description": "The exact function name to replace (for patch_function)."
+                }
+            },
+            "required": ["action", "file_path"]
         }
     },
     {
@@ -519,6 +590,54 @@ TOOL_DECLARATIONS = [
         }
     },
     {
+        "name": "tv_controller",
+        "description": (
+            "Controls the Sony Bravia TV (Display 2 connected via HDMI) and Microsoft Edge YouTube playback, "
+            "as well as moving any open application or window between the Laptop (Display 1) and TV (Display 2). "
+            "IMPORTANT: When user says 'skip', 'skip ad', 'skip the ad', or 'skip the video' during an advertisement, "
+            "ALWAYS pass action='skip_ad'. NEVER call next_video unless they specifically say 'next video'.\n"
+            "Supported actions:\n"
+            "- 'tv_mode': Activates TV mode / cinema mode and opens Edge YouTube on TV.\n"
+            "- 'search': Searches YouTube on TV (pass search terms in 'query').\n"
+            "- 'skip_ad': Clicks the Skip Ad button on YouTube.\n"
+            "- 'click_first' | 'click_second' | 'click_third': Plays the 1st, 2nd, or 3rd video from search results.\n"
+            "- 'scroll_down' | 'scroll_up': Scrolls the YouTube page on TV.\n"
+            "- 'play_pause': Toggles play or pause.\n"
+            "- 'fullscreen': Toggles fullscreen on TV.\n"
+            "- 'theater': Toggles theater mode on TV.\n"
+            "- 'mute': Mutes/unmutes audio.\n"
+            "- 'volume_up' | 'volume_down': Adjusts volume.\n"
+            "- 'rewind' | 'fast_forward': Seeks backward or forward 10 seconds.\n"
+            "- 'restart': Restarts video from the beginning.\n"
+            "- 'speed_up' | 'slow_down': Changes playback speed.\n"
+            "- 'captions': Toggles subtitles.\n"
+            "- 'next_video': Advances to the next video in queue.\n"
+            "- 'move_window': Moves any app between 'tv' and 'laptop' (pass 'app_name' and 'target_display')."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": "tv_mode | search | skip_ad | click_first | click_second | click_third | scroll_down | scroll_up | play_pause | fullscreen | theater | mute | volume_up | volume_down | rewind | fast_forward | restart | speed_up | slow_down | captions | next_video | move_window"
+                },
+                "query": {
+                    "type": "STRING",
+                    "description": "Search query for YouTube"
+                },
+                "app_name": {
+                    "type": "STRING",
+                    "description": "Name of the window to move (e.g. 'Edge', 'ChatGPT', 'Chrome', 'Steam')"
+                },
+                "target_display": {
+                    "type": "STRING",
+                    "description": "'tv' (Display 2) or 'laptop' (Display 1)"
+                }
+            },
+            "required": ["action"]
+        }
+    },
+    {
         "name": "dev_agent",
         "description": "Builds complete multi-file projects from scratch: plans, writes files, installs deps, opens VSCode, runs and fixes errors.",
         "parameters": {
@@ -533,12 +652,51 @@ TOOL_DECLARATIONS = [
         }
     },
     {
-        "name": "computer_control",
-        "description": "Direct computer control: type, click, hotkeys, scroll, move mouse, screenshots, find elements on screen.",
+        "name": "codebase_inspector",
+        "description": (
+            "Gives full awareness of Nexus AI's internal codebase, architecture, and live changes. "
+            "Call this tool whenever the user asks what was changed, what they edited, or what was modified recently in this session. "
+            "Supports English, Urdu, and Roman Urdu.\n"
+            "Actions:\n"
+            "- 'recent_changes': Explains what code was edited, added, or modified recently in the session.\n"
+            "- 'read_file': Reads actual code lines with line numbers from any file.\n"
+            "- 'search_code': Searches the codebase for exact function names, tools, or terms.\n"
+            "- 'list_tree': Shows all files and folders in Nexus's directory."
+        ),
         "parameters": {
             "type": "OBJECT",
             "properties": {
-                "action":      {"type": "STRING", "description": "type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | screenshot | wait | clear_field | focus_window | screen_find | screen_click | random_data | user_data"},
+                "action": {
+                    "type": "STRING",
+                    "description": "recent_changes | read_file | search_code | list_tree"
+                },
+                "file_path": {
+                    "type": "STRING",
+                    "description": "Path to file (e.g. 'main.py', 'actions/computer_control.py') or directory for list_tree."
+                },
+                "query": {
+                    "type": "STRING",
+                    "description": "Text, function name, or tool name to search."
+                },
+                "start_line": {
+                    "type": "INTEGER",
+                    "description": "Starting line number for read_file (default: 1)."
+                }
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "computer_control",
+        "description": (
+            "Direct computer control: type, click, hotkeys, scroll, move mouse, screenshots, find elements on screen, "
+            "clipboard management (clear clipboard, copy, paste), and running any custom script action (e.g. 'final_override', 'matrix'). "
+            "ALWAYS call this tool whenever the user asks to run an action in computer control or execute a custom function."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action":      {"type": "STRING", "description": "The action: type | smart_type | click | double_click | right_click | hotkey | press | scroll | move | copy | paste | clear_clipboard | final_override | matrix | screenshot | wait | clear_field | focus_window | screen_find | screen_click | any custom action name"},
                 "text":        {"type": "STRING", "description": "Text to type or paste"},
                 "x":           {"type": "INTEGER", "description": "X coordinate"},
                 "y":           {"type": "INTEGER", "description": "Y coordinate"},
@@ -553,6 +711,37 @@ TOOL_DECLARATIONS = [
                 "field":       {"type": "STRING",  "description": "Field for user_data: name|email|city"},
                 "clear_first": {"type": "BOOLEAN", "description": "Clear field before typing (default: true)"},
                 "path":        {"type": "STRING",  "description": "Save path for screenshot"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "computer_settings",
+        "description": (
+            "Controls Windows system settings: Light mode, Dark mode, system themes, master volume, "
+            "Wi-Fi toggle, DNS flushing, emptying Recycle Bin, clearing temp files, screen sleep, and power plans. "
+            "ALWAYS call this tool when the user asks to switch to light mode, dark mode, toggle theme, "
+            "adjust volume, toggle Wi-Fi, clean temp files, or empty recycle bin."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {
+                    "type": "STRING",
+                    "description": (
+                        "light_mode | dark_mode | toggle_dark_mode | volume_up | volume_down | "
+                        "mute | volume_set | toggle_wifi | flush_dns | empty_recycle_bin | "
+                        "clear_temp | clear_clipboard | sleep_display | lock_screen | sleep_pc"
+                    )
+                },
+                "value": {
+                    "type": "STRING",
+                    "description": "Optional numeric value for volume (e.g. '50', '80')."
+                },
+                "description": {
+                    "type": "STRING",
+                    "description": "Optional description of the setting to change."
+                }
             },
             "required": ["action"]
         }
@@ -932,20 +1121,24 @@ class DedicatedAudioPlayer:
         self.is_playing = False
 
     def _worker(self):
-        try:
-            stream = sd.RawOutputStream(
-                samplerate=self.sample_rate,
-                channels=self.channels,
-                dtype="int16",
-                blocksize=1024,
-            )
-            stream.start()
-        except Exception as e:
-            print(f"[AudioPlayer] Output device error: {e}")
-            return
-
+        stream = None
         while not self._stop_event.is_set():
-            # 1. Jitter pre-buffer: Accumulate at least 4 chunks (~160ms) before starting playback
+            # 1. Automatically establish or heal connection to Windows default sound device
+            if stream is None:
+                try:
+                    stream = sd.RawOutputStream(
+                        samplerate=self.sample_rate,
+                        channels=self.channels,
+                        dtype="int16",
+                        blocksize=1024,
+                    )
+                    stream.start()
+                except Exception as e:
+                    # Audio device unplugged or busy: retry every 1 second without dying
+                    time.sleep(1.0)
+                    continue
+
+            # 2. Jitter pre-buffer: Accumulate at least 4 chunks (~160ms) before starting playback
             if not self.is_playing:
                 if self.queue.qsize() < 4 and not self._turn_complete_flag.is_set():
                     time.sleep(0.01)
@@ -955,28 +1148,33 @@ class DedicatedAudioPlayer:
                     continue
                 self.is_playing = True
 
-            # 2. Continuous playback loop
+            # 3. Continuous playback loop with auto-recovery from driver disconnects
             try:
                 chunk = self.queue.get(timeout=0.35)
-                # ── Digital DSP Pre-Amp Booster (3.5x Volume Multiplier) ──
                 import numpy as _np
-                # Google raw audio is mastered at -22 dBFS; we boost it to fill 100% speaker power
                 samples = _np.frombuffer(chunk, dtype=_np.int16).astype(_np.float32)
-                # Soft analog saturation curve prevents clipping & harsh distortion
                 boosted = _np.tanh((samples * 3.5) / 32767.0) * 32767.0
                 stream.write(boosted.astype(_np.int16).tobytes())
                 self._last_chunk_time = time.monotonic()
             except queue.Empty:
-                # If Gemini flagged turn completion and all chunks are played, drain hardware buffer
                 if self._turn_complete_flag.is_set():
-                    time.sleep(0.25)  # Allow physical PortAudio buffer to clear out
+                    time.sleep(0.25)
                     self.is_playing = False
                     with self._lock:
                         self._active_turn = False
                 else:
-                    # Model still generating; hold stream open through brief network latency
                     if time.monotonic() - self._last_chunk_time > 0.85:
                         self.is_playing = False
+            except Exception as write_err:
+                print(f"\n[AudioPlayer] ⚠️ Audio device blip ({write_err}). Reconnecting to Windows default sound...")
+                try:
+                    if stream:
+                        stream.stop()
+                        stream.close()
+                except Exception:
+                    pass
+                stream = None
+                time.sleep(0.8)
 
 class JarvisLive:
 
@@ -1018,6 +1216,7 @@ class JarvisLive:
         self._last_active_speech_t = 0.0
         self._has_spoken_in_turn = False
         self._vosk_rec = None
+        self._vosk_lock = threading.Lock()
         self._init_offline_wake_engine()
 
         self._enhanced_live = True  # affective dialog + proactive audio; auto-disabled if the server rejects them
@@ -1219,10 +1418,6 @@ class JarvisLive:
             input_audio_transcription={},
             system_instruction="\n".join(parts),
             tools=[{"function_declarations": TOOL_DECLARATIONS + self._plugin_registry.get_tool_declarations()}],
-            session_resumption=types.SessionResumptionConfig(),
-            context_window_compression=types.ContextWindowCompressionConfig(
-                sliding_window=types.SlidingWindow(),
-            ),
             speech_config=types.SpeechConfig(
                 voice_config=types.VoiceConfig(
                     prebuilt_voice_config=types.PrebuiltVoiceConfig(
@@ -1260,6 +1455,48 @@ class JarvisLive:
             if name == "open_app":
                 r = await loop.run_in_executor(None, lambda: open_app(parameters=args, response=None, player=self.ui))
                 result = r or f"Opened {args.get('app_name')}."
+                
+            elif name == "tv_controller":
+                r = await loop.run_in_executor(
+                    None,
+                    lambda: tv_controller(parameters=args, player=self.ui)
+                )
+                result = r or "Done."
+                
+            elif name == "codebase_inspector":
+                r = await loop.run_in_executor(
+                    None,
+                    lambda: codebase_inspector(parameters=args, player=self.ui)
+                )
+                result = r or "Codebase inspection completed."
+                
+            elif name == "computer_control":
+                r = await loop.run_in_executor(
+                    None, 
+                    lambda: dispatch_action("computer_control", "computer_control", parameters=args, player=self.ui)
+                )
+                result = r or "Done."
+
+            elif name == "reminder":
+                r = await loop.run_in_executor(
+                    None, 
+                    lambda: dispatch_action("reminder", "reminder", parameters=args, response=None, player=self.ui)
+                )
+                result = r or "Reminder set."
+
+            elif name == "weather_report":
+                r = await loop.run_in_executor(
+                    None, 
+                    lambda: dispatch_action("weather_report", "weather_action", parameters=args, player=self.ui)
+                )
+                result = r or "Weather delivered."
+
+            elif name == "self_evolution":
+                r = await loop.run_in_executor(
+                    None,
+                    lambda: self_evolution(parameters=args, player=self.ui)
+                )
+                result = r or "Self-evolution completed."
                 
             elif name == "generate_image":
                 img_prompt = args.get("prompt", "")
@@ -1438,7 +1675,10 @@ class JarvisLive:
                 result = "Camera closed."
 
             elif name == "computer_settings":
-                r = await loop.run_in_executor(None, lambda: computer_settings(parameters=args, response=None, player=self.ui))
+                r = await loop.run_in_executor(
+                    None, 
+                    lambda: dispatch_action("computer_settings", "computer_settings", parameters=args, response=None, player=self.ui)
+                )
                 result = r or "Done."
 
             elif name == "desktop_control":
@@ -1575,25 +1815,34 @@ class JarvisLive:
             if self.ui.muted:
                 self.ui.avatar_set_audio_energy(0.0)
                 if self._vosk_rec and not getattr(self, '_is_unmuting', False):
-                    res_txt = ""
-                    if self._vosk_rec.AcceptWaveform(raw_bytes):
-                        res_txt = json.loads(self._vosk_rec.Result()).get("text", "").lower()
-                    else:
-                        res_txt = json.loads(self._vosk_rec.PartialResult()).get("partial", "").lower()
+                    try:
+                        with self._vosk_lock:
+                            res_txt = ""
+                            if self._vosk_rec.AcceptWaveform(raw_bytes):
+                                res_txt = json.loads(self._vosk_rec.Result()).get("text", "").lower()
+                            else:
+                                res_txt = json.loads(self._vosk_rec.PartialResult()).get("partial", "").lower()
 
-                    # Exact whole-word matching (ignores other languages or random words)
-                    if res_txt:
-                        tokens = set(re.findall(r"\b[a-z]+\b", res_txt))
-                        if "nexus" in tokens or "computer" in tokens:
-                            self._is_unmuting = True
-                            self._vosk_rec.Reset()
-                            print("[WakeWord] ⚡ Detected wake word while muted! Unmuting now...")
-                            self.ui.write_log("SYS: ⚡ Wake word detected! Unmuting...")
-                            self.ui.muted = False
-                            self._has_spoken_in_turn = False
-                            self._last_active_speech_t = now
-                            self.ui.set_state("LISTENING")
-                            self.ui.avatar_pulse()
+                            # Exact whole-word matching (ignores other languages or random words)
+                            if res_txt:
+                                tokens = set(re.findall(r"\b[a-z]+\b", res_txt))
+                                if "nexus" in tokens or "computer" in tokens:
+                                    self._is_unmuting = True
+                                    self._vosk_rec.Reset()
+                                    print("[WakeWord] ⚡ Detected wake word while muted! Unmuting now...")
+                                    self.ui.write_log("SYS: ⚡ Wake word detected! Unmuting...")
+                                    self.ui.muted = False
+                                    self._has_spoken_in_turn = False
+                                    self._last_active_speech_t = now
+                                    self.ui.set_state("LISTENING")
+                                    self.ui.avatar_pulse()
+                    except Exception:
+                        # Auto-recover from any internal recognizer collision cleanly
+                        try:
+                            with self._vosk_lock:
+                                self._vosk_rec.Reset()
+                        except Exception:
+                            pass
                 return
 
             # ── STATE 2: AI IS UNMUTED ───────────────────────────────────────
@@ -1607,9 +1856,10 @@ class JarvisLive:
                 rms = 0.0
 
             if rms < ambient_floor * 1.5:
-                ambient_floor = ambient_floor * 0.95 + rms * 0.05
+                # Clamp ambient floor to 850 so loud TV sound never blocks your voice!
+                ambient_floor = min(850.0, ambient_floor * 0.95 + rms * 0.05)
 
-            speech_gate = max(650.0, ambient_floor * 2.2)
+            speech_gate = max(650.0, min(1400.0, ambient_floor * 1.8))
 
             if rms > speech_gate:
                 self._has_spoken_in_turn = True
@@ -1629,6 +1879,13 @@ class JarvisLive:
                     print("[AutoMute] 🤫 Sentence finished. Muting mic and waiting for AI response.")
                     self._has_spoken_in_turn = False
                     self.ui.muted = True
+                    # Flush lingering audio buffer so it doesn't violate WebSocket turn boundaries
+                    if self.out_queue:
+                        while not self.out_queue.empty():
+                            try:
+                                self.out_queue.get_nowait()
+                            except Exception:
+                                break
                     self.ui.set_state("THINKING")
 
         while True:
@@ -1670,12 +1927,12 @@ class JarvisLive:
                     if not self.ui.muted:
                         self.ui.muted = True
                     if self._vosk_rec:
-                        self._vosk_rec.Reset()
-                    self._has_spoken_in_turn = False
+                        try:
+                            with self._vosk_lock:
+                                self._vosk_rec.Reset()
+                        except Exception:
+                            pass
 
-                    # Return wake engine to offline STANDBY mode
-                    if self._vosk_rec:
-                        self._vosk_rec.Reset()
                     self._wake_state = "STANDBY"
                     self._has_spoken_in_turn = False
                     self.ui.set_state("LISTENING")
@@ -1729,8 +1986,13 @@ class JarvisLive:
                             if full_out:
                                 self.ui.write_log(f"{self._asst_name}: {full_out}")
                                 self._session_log.append(f"{self._asst_name}: {full_out}")
+                                if self._dashboard:
+                                    asyncio.create_task(self._dashboard.broadcast({
+                                        "type": "ai_response",
+                                        "text": full_out
+                                    }))
                             out_buf = []
-
+                            
                             # Vision injection: runs if an image was captured
                             if self._pending_vision and self.session:
                                 import base64 as _b64
@@ -1898,14 +2160,14 @@ class JarvisLive:
             client = _genai.Client(api_key=_get_api_key())
             resp   = await asyncio.to_thread(
                 client.models.generate_content,
-                model="gemini-flash-latest",
+                model="gemini-2.0-flash",
                 contents=prompt,
             )
             summary = (resp.text or "").strip()
             if summary:
                 save_session_summary(summary, lang)
-        except Exception as e:
-            print(f"[Memory] ⚠️ Session summary failed: {e}")
+        except Exception:
+            pass  # Fail silently without interrupting reconnects or throwing 404/429
 
     # ── System monitor ──────────────────────────────────────────────────────────
 
@@ -2096,29 +2358,88 @@ class JarvisLive:
                 )
                 if not text:
                     continue
-                # Wait up to 8s for session to become ready after a wake
+
+                # Wait up to 8s for Gemini session to be ready
                 for _ in range(80):
                     if self.session:
                         break
                     await asyncio.sleep(0.1)
+
                 if self.session:
-                    await self.session.send_client_content(
-                        turns={"parts": [{"text": text}]},
-                        turn_complete=True,
-                    )
-                    self.ui.write_log(f"[Web]: {text}")
+                    print(f"\n[Dashboard] ⚡ EXECUTING REMOTE COMMAND: '{text}'")
+                    self.ui.write_log(f"Remote: {text}")
+
+                    # Reset interrupt lock so PC speaker plays the voice response loudly
+                    self._interrupted = False
+                    self._wake_active = True
+                    self.ui.set_state("THINKING")
+
+                    async with self._send_lock:
+                        await self.session.send_client_content(
+                            turns={"parts": [{"text": text}]},
+                            turn_complete=True,
+                        )
                 else:
                     print(f"[Dashboard] Dropped command (no session): {text}")
             except asyncio.TimeoutError:
                 pass
             except Exception as e:
-                print(f"[Dashboard] Command error: {e}")
+                print(f"[Dashboard] Command relay error: {e}")
                 await asyncio.sleep(0.5)
 
     # ── main loop ───────────────────────────────────────────────────────────
 
     async def run(self):
         self._loop = asyncio.get_event_loop()
+
+        # Background task: watches actions/ folder for manual Ctrl+S saves
+        async def _watch_for_manual_edits():
+            actions_dir = BASE_DIR / "actions"
+            # Pre-seed snapshots so we can diff the very first save
+            if actions_dir.exists():
+                for py_file in actions_dir.glob("*.py"):
+                    try:
+                        from actions.codebase_inspector import _FILE_SNAPSHOTS
+                        _FILE_SNAPSHOTS[py_file.name] = py_file.read_text(encoding="utf-8", errors="replace")
+                    except Exception:
+                        pass
+
+            while True:
+                await asyncio.sleep(1.0)
+                if not actions_dir.exists():
+                    continue
+                for py_file in actions_dir.glob("*.py"):
+                    mod_key = f"actions.{py_file.stem}"
+                    try:
+                        mtime = py_file.stat().st_mtime
+                    except Exception:
+                        continue
+
+                    last_mtime = _ACTION_MTIMES.get(mod_key)
+                    if last_mtime is None:
+                        _ACTION_MTIMES[mod_key] = mtime
+                    elif mtime > last_mtime:
+                        _ACTION_MTIMES[mod_key] = mtime
+                        diff_log = ""
+                        try:
+                            new_text = py_file.read_text(encoding="utf-8", errors="replace")
+                            from actions.codebase_inspector import record_change
+                            diff_log = record_change(py_file, new_text)
+                        except Exception:
+                            pass
+
+                        try:
+                            if mod_key in sys.modules:
+                                importlib.reload(sys.modules[mod_key])
+                            print(f"\n[HotReload] ⚡ Live reloaded '{py_file.name}'!")
+                            if diff_log:
+                                print(f"[CodeAware] 📝 Changes detected:\n{diff_log}")
+                            self.ui.write_log(f"SYS: ⚡ Reloaded '{py_file.name}' live!")
+                        except Exception as e:
+                            print(f"[HotReload] ❌ Error reloading '{py_file.name}': {e}")
+                            self.ui.write_log(f"ERR: Error in '{py_file.name}': {e}")
+
+        asyncio.create_task(_watch_for_manual_edits())
 
         # Start dashboard (optional — needs: pip install fastapi "uvicorn[standard]" cryptography)
         try:

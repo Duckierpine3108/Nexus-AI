@@ -1,42 +1,94 @@
-# Python Bytecode & Cache
-__pycache__
-.py[cod]
-$py.class
-.pyd
+# =============================================================================
+#  NEXUS AI — PRODUCTION GITIGNORE
+#  Architected for Python, PyQt6, Playwright, PyInstaller & Inno Setup
+# =============================================================================
 
-# PyInstaller Build Artifacts (NEVER COMMIT)
-build
-dist
-Output
-.spec
+# ── 1. Executables & Installers (Uploaded to GitHub Releases) ────────────────
+# Precompiled setups must NEVER be stored in git history.
+# Download binaries directly from: https://github.com/Duckierpine3108/Nexus-AI/releases
+*.exe
+*.msi
+*.dll
+*.so
+*.dylib
+
+# ── 2. PyInstaller & Build Output Directories ────────────────────────────────
+build/
+dist/
+Output/
+*.manifest
+*.spec.bak
+# Ignore auto-generated spec files, but preserve the primary production spec:
+*.spec
 !nexus_ai.spec
 
-# Executables & Installers (Uploaded to GitHub Releases instead)
-.exe
-.msi
+# ── 3. Python Bytecode, C-Extensions & Caches ─────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+*.pyo
+.pytest_cache/
+.mypy_cache/
 
-# Local Configuration & Sensitive Credentials
-configapi_keys.json
-configsplash_session.lock
-configevolution_session.json
-configdevices_telemetry.json
-configuser_voiceprint.npy
-configcerts
+# ── 4. Virtual Environments & Package Managers ──────────────────────────────
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
 
-# Memory & Runtime Logs
-memorylong_term.json
-.log
+# ── 5. Sensitive Credentials, Secrets & Certificates ─────────────────────────
+# Keep private API keys and SSL keys strictly on local machines!
+.env
+*.env
+.env.*
+api_keys.json
+config/api_keys.json
+config/certs/*.key
+config/certs/*.pem
+jarvis.key
+jarvis.crt
+
+# ── 6. Local User State, Biometrics & Hardware Telemetry ──────────────────────
+# Prevents overwriting individual workstation runtime state and user voiceprints:
+config/devices_telemetry.json
+config/evolution_session.json
+config/last_splash.json
+config/splash_session.lock
+config/user_voiceprint.npy
+
+# ── 7. Long-Term Memory & Local Databases ────────────────────────────────────
+# User workout records (pushup PRs), agent chat logs, and vector memory:
+memory/long_term.json
+*.db
+*.sqlite
+*.sqlite3
+
+# ── 8. System Diagnostics, Trees & Runtime Logs ──────────────────────────────
+*.log
 nexus_tree.txt
 nexus_structure.txt
+*.tmp
+*.bak
 
-# Virtual Environments
-venv
-env
-ENV
+# ── 9. Playwright & Browser Artifacts ────────────────────────────────────────
+playwright-report/
+test-results/
+.playwright/
 
-# IDE & OS Metadata
-.vscode
-.idea
+# ── 10. Operating System & Code Editor Metadata ──────────────────────────────
+.vscode/
+.idea/
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.swp
+*.swo
 Thumbs.db
-Desktop.ininexus_ai.iss 
-nexus_ai.spec 
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.DS_Store

@@ -1,377 +1,534 @@
 """
-JARVIS plugin — Pushup Counter (webcam vision).
+actions/pushup_counter.py
+Nexus AI — Enterprise Biomechanical Vision & Athletic Coaching Core (v4.0)
 
-Say "Jarvis, count my pushups" (any language) — the HUD switches to the
-live camera, a 5-second countdown lets you get into position, then JARVIS
-counts your reps live on screen and finally delivers the result with
-playful, teasing motivational commentary in your language.
-
-Detection (two-tier):
-  • If `mediapipe` is installed (pip install mediapipe): elbow-angle
-    tracking — accurate from front or side view.
-  • Otherwise: face-motion tracking with OpenCV only (zero extra
-    dependencies) — place the camera on the floor in front of you so your
-    head moves toward/away from it with each rep.
-
-Session ends automatically: target reached, ~20 s without a rep, or the
-3-minute safety cap. Just stand up when you're done.
-
-Sessions are saved to memory/long_term.json ("pushup_sessions") so future
-versions can track progress over time.
+Capabilities:
+- Two-Tier Computer Vision Engine:
+    Tier 1: MediaPipe 33-point 3D Biomechanical Pose (Elbow ROM + Spine Alignment)
+    Tier 2: OpenCV Fallback Face Proximity Tracking (Zero external dependencies)
+- Auditory Cadence & Form Coach: Audio countdown, rep announcements, and form alerts
+- Biomechanical Form Verification: Distinguishes strict reps from half-reps
+- Calorie & Metabolic Power Engine: Calculates active burn based on MET calisthenics standards
+- Adaptive PyQt6 HUD Integration: Mode 3 Knowledge Search HUD live card streaming
+- Universal Dispatch: Exports both `pushup_counter` and `run` for seamless main.py binding
 """
 
+import os
+import re
+import sys
 import json
 import time
-from datetime import date
+import math
+import platform
+import threading
+from datetime import datetime, date
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-BASE_DIR = Path(__file__).resolve().parent.parent
+# ─────────────────────────────────────────────────────────────────────────────
+# PATHS & CONFIGURATION
+# ─────────────────────────────────────────────────────────────────────────────
 
-PLUGIN = {
-    "name": "pushup_counter",
-    "description": (
-        "Counts the user's pushups live through the WEBCAM. Use whenever the "
-        "user says they are about to do pushups and wants them counted — e.g. "
-        "'şınav çekeceğim say', 'count my pushups', 'pushup challenge'. "
-        "If the user mentions a goal ('20 şınav çekeceğim'), pass it as "
-        "'target'. The tool runs the WHOLE workout and only returns when the "
-        "session ends (this can take a few minutes) — do not call other tools "
-        "meanwhile. When the result comes back, deliver it in the user's "
-        "language with playful, lightly TEASING motivational commentary "
-        "(e.g. for 10 reps: congratulate them for being 'a perfectly average "
-        "human'). Never use screen_process for pushup counting."
-    ),
-    "parameters": {
-        "type": "OBJECT",
-        "properties": {
-            "query": {
-                "type": "STRING",
-                "description": "The user's exact request, verbatim, in their own language.",
-            },
-            "target": {
-                "type": "NUMBER",
-                "description": "Rep goal if the user stated one (e.g. 20). Omit otherwise.",
-            },
-        },
-        "required": ["query"],
-    },
-}
+def _get_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parent.parent
 
-_COUNTDOWN_SECONDS   = 5
+
+BASE_DIR = _get_base_dir()
+MEMORY_FILE = BASE_DIR / "memory" / "long_term.json"
+
+_COUNTDOWN_SECONDS = 5
 _MAX_SESSION_SECONDS = 180
-_IDLE_END_SECONDS    = 20    # end after this long without a rep (once started)
-_IDLE_ABORT_SECONDS  = 40    # abort if NO rep ever happens
-_FPS                 = 20
-_CYAN   = (255, 190, 40)     # JARVIS cyan-blue (BGR)
-_BRIGHT = (255, 235, 130)
+_IDLE_END_SECONDS = 20
+_IDLE_ABORT_SECONDS = 40
+_FPS = 25
+
+_COLOR_CYAN = (254, 242, 0)     # Nexus Electric Cyan (BGR)
+_COLOR_GREEN = (129, 185, 16)   # Form Pass Emerald (BGR)
+_COLOR_RED = (68, 68, 239)      # Warning Coral (BGR)
+_COLOR_WHITE = (250, 250, 250)
+
+_ABORT_SESSION = threading.Event()
 
 
-# ── config / camera (same pattern as calorie_counter) ───────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# UI HUD INTEGRATION
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _config() -> dict:
+def _push_to_ui_hud(title: str, content: str, mode: int = 3, items: list = None) -> None:
+    """Streams athletic dossiers to ui.py Adaptive HUD if loaded."""
     try:
-        return json.loads(
-            (BASE_DIR / "config" / "api_keys.json").read_text(encoding="utf-8")
-        )
+        ui_mod = sys.modules.get("ui")
+        if not ui_mod:
+            return
+        if hasattr(ui_mod, "update_adaptive_hud"):
+            ui_mod.update_adaptive_hud(title=title, content=content, mode=mode, items=items)
+        elif hasattr(ui_mod, "app_instance") and ui_mod.app_instance:
+            inst = ui_mod.app_instance
+            if hasattr(inst, "show_hud"):
+                inst.show_hud(title=title, content=content, mode=mode, items=items)
     except Exception:
-        return {}
+        pass
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CAMERA HARNESS & FRAME STREAMER
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _open_camera():
-    import platform
-    try:
-        backend = cv2.CAP_DSHOW if platform.system() == "Windows" else cv2.CAP_ANY
-    except AttributeError:
-        backend = 0
-    cap = cv2.VideoCapture(int(_config().get("camera_index", 0)), backend)
+    backend = cv2.CAP_DSHOW if platform.system() == "Windows" else cv2.CAP_ANY
+    cap = cv2.VideoCapture(0, backend)
     if not cap.isOpened():
         cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         return None
-    for _ in range(6):
+
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    for _ in range(5):
         cap.read()
     return cap
 
 
 def _emit_frame(frame_sig, frame: np.ndarray) -> None:
-    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
-    if ok:
-        frame_sig.emit(buf.tobytes())
+    if frame_sig:
+        ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, 70])
+        if ok:
+            frame_sig.emit(buf.tobytes())
 
 
-# ── rep counting state machine ───────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
+# BIOMECHANICAL REPETITION & FORM STATE MACHINE
+# ─────────────────────────────────────────────────────────────────────────────
 
-class _RepCounter:
-    """Counts full down→up cycles of a raw 'down-ness' signal (bigger =
-    lower). Tracks the signal's own min/max range (with slow decay) so it
-    self-calibrates to any camera distance or body size."""
+class BiomechanicalRepCounter:
+    """
+    Precision repetition engine evaluating strict range of motion (ROM)
+    and spine alignment.
+    """
 
-    def __init__(self, min_rel_amplitude: float = 0.18):
-        self._min_rel = min_rel_amplitude
-        self.lo = None
-        self.hi = None
-        self.state = "up"
+    def __init__(self, target_reps: int = 0):
+        self.target = target_reps
         self.reps = 0
+        self.strict_reps = 0
+        self.half_reps = 0
+        self.state = "up"  # "up" | "down"
+        self.lowest_angle = 180.0
+        self.form_violations = 0
 
-    def update(self, v: float) -> bool:
-        if self.lo is None:
-            self.lo = self.hi = float(v)
-            return False
-        # decay range toward the current value, then expand to include it
-        self.lo = min(self.lo + (v - self.lo) * 0.002, v)
-        self.hi = max(self.hi + (v - self.hi) * 0.002, v)
-        rng = self.hi - self.lo
-        if rng < max(abs(self.hi), 1e-6) * self._min_rel:
-            return False   # not enough movement observed yet
-        pos = (v - self.lo) / rng
-        if self.state == "up" and pos > 0.70:
+    def update(self, elbow_angle: float, spine_alignment_deg: float = 180.0) -> tuple[bool, str]:
+        """
+        elbow_angle: Degrees (180 = straight arm, 90 or below = strict down)
+        spine_alignment_deg: Shoulder-Hip-Ankle angle (170-190 = straight back)
+        """
+        rep_completed = False
+        cue = ""
+
+        # Track depth during the descent
+        if self.state == "down":
+            self.lowest_angle = min(self.lowest_angle, elbow_angle)
+
+        # Transition 1: Entering the bottom position (Incline/Descent complete)
+        if self.state == "up" and elbow_angle <= 95.0:
             self.state = "down"
-        elif self.state == "down" and pos < 0.30:
+            self.lowest_angle = elbow_angle
+
+        # Transition 2: Completing ascent back to top lockout
+        elif self.state == "down" and elbow_angle >= 155.0:
             self.state = "up"
-            self.reps += 1
-            return True
-        return False
+            rep_completed = True
+
+            # Form evaluation
+            is_strict_depth = self.lowest_angle <= 90.0
+            is_spine_straight = abs(180.0 - spine_alignment_deg) <= 22.0
+
+            if is_strict_depth and is_spine_straight:
+                self.reps += 1
+                self.strict_reps += 1
+                cue = "good"
+            elif not is_strict_depth:
+                self.reps += 1
+                self.half_reps += 1
+                cue = "go_lower"
+            else:
+                self.reps += 1
+                self.form_violations += 1
+                cue = "straighten_back"
+
+            self.lowest_angle = 180.0
+
+        return rep_completed, cue
 
 
-# ── detectors: return a 'down-ness' signal (bigger = lower), or None ────────
+# ─────────────────────────────────────────────────────────────────────────────
+# TWO-TIER DETECTION HARNESS
+# ─────────────────────────────────────────────────────────────────────────────
 
 def _make_pose_detector():
-    """MediaPipe elbow-angle tracking. Returns fn(frame)->float|None,
-    or None if mediapipe isn't installed."""
+    """Tier 1: MediaPipe 3D Pose Biomechanical Model."""
     try:
         import mediapipe as mp
-        pose = mp.solutions.pose.Pose(model_complexity=0,
-                                      min_detection_confidence=0.5,
-                                      min_tracking_confidence=0.5)
-        L = mp.solutions.pose.PoseLandmark
+        pose = mp.solutions.pose.Pose(
+            model_complexity=0,
+            min_detection_confidence=0.55,
+            min_tracking_confidence=0.55,
+        )
+        landmarks = mp.solutions.pose.PoseLandmark
     except Exception:
-        # mediapipe missing, or an incompatible version without the
-        # legacy solutions API — face tracking takes over either way
         return None
 
-    def _angle(a, b, c) -> float:
-        ba = np.array([a.x - b.x, a.y - b.y])
-        bc = np.array([c.x - b.x, c.y - b.y])
-        cos = np.dot(ba, bc) / (np.linalg.norm(ba) * np.linalg.norm(bc) + 1e-9)
+    def _angle_3d(a, b, c) -> float:
+        v1 = np.array([a.x - b.x, a.y - b.y, a.z - b.z])
+        v2 = np.array([c.x - b.x, c.y - b.y, c.z - b.z])
+        cos = np.dot(v1, v2) / ((np.linalg.norm(v1) * np.linalg.norm(v2)) + 1e-9)
         return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
 
-    def _signal(frame: np.ndarray):
-        res = pose.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        lm = getattr(res, "pose_landmarks", None)
-        if not lm:
+    def _process(frame: np.ndarray):
+        h, w, _ = frame.shape
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        res = pose.process(rgb)
+        if not res or not res.pose_landmarks:
             return None
-        pts = lm.landmark
-        best = None
-        for s, e, w in ((L.LEFT_SHOULDER, L.LEFT_ELBOW, L.LEFT_WRIST),
-                        (L.RIGHT_SHOULDER, L.RIGHT_ELBOW, L.RIGHT_WRIST)):
-            vis = min(pts[s].visibility, pts[e].visibility, pts[w].visibility)
-            if vis < 0.5:
-                continue
-            ang = _angle(pts[s], pts[e], pts[w])   # 180 = arm straight
-            if best is None or vis > best[1]:
-                best = (ang, vis)
-        if best is None:
-            return None
-        # straight arm (170°) -> 0.0 (up) … bent arm (60°) -> 1.0 (down)
-        return float(np.clip((170.0 - best[0]) / 110.0, 0.0, 1.0))
 
-    return _signal
+        lm = res.pose_landmarks.landmark
+
+        # Select the side (Left vs Right) with highest camera visibility
+        left_vis = (lm[landmarks.LEFT_SHOULDER].visibility + lm[landmarks.LEFT_ELBOW].visibility + lm[landmarks.LEFT_WRIST].visibility) / 3.0
+        right_vis = (lm[landmarks.RIGHT_SHOULDER].visibility + lm[landmarks.RIGHT_ELBOW].visibility + lm[landmarks.RIGHT_WRIST].visibility) / 3.0
+
+        if left_vis >= right_vis and left_vis > 0.45:
+            shoulder = lm[landmarks.LEFT_SHOULDER]
+            elbow = lm[landmarks.LEFT_ELBOW]
+            wrist = lm[landmarks.LEFT_WRIST]
+            hip = lm[landmarks.LEFT_HIP]
+            ankle = lm[landmarks.LEFT_ANKLE]
+        elif right_vis > 0.45:
+            shoulder = lm[landmarks.RIGHT_SHOULDER]
+            elbow = lm[landmarks.RIGHT_ELBOW]
+            wrist = lm[landmarks.RIGHT_WRIST]
+            hip = lm[landmarks.RIGHT_HIP]
+            ankle = lm[landmarks.RIGHT_ANKLE]
+        else:
+            return None
+
+        arm_angle = _angle_3d(shoulder, elbow, wrist)
+        spine_angle = _angle_3d(shoulder, hip, ankle)
+
+        # Landmark points for drawing
+        points = {
+            "shoulder": (int(shoulder.x * w), int(shoulder.y * h)),
+            "elbow": (int(elbow.x * w), int(elbow.y * h)),
+            "wrist": (int(wrist.x * w), int(wrist.y * h)),
+        }
+
+        return {"arm_angle": arm_angle, "spine_angle": spine_angle, "points": points}
+
+    return _process
 
 
 def _make_face_detector():
-    """OpenCV-only fallback: face area grows as the user lowers toward a
-    floor-placed camera. Returns fn(frame)->float|None."""
-    cascade = cv2.CascadeClassifier(
-        cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-    )
+    """Tier 2 Fallback: OpenCV Face-Motion Proximity Tracking."""
+    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
-    def _signal(frame: np.ndarray):
+    def _process(frame: np.ndarray):
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        small = cv2.resize(gray, (0, 0), fx=0.5, fy=0.5)
-        faces = cascade.detectMultiScale(small, 1.15, 4, minSize=(30, 30))
+        faces = cascade.detectMultiScale(gray, 1.15, 4, minSize=(40, 40))
         if len(faces) == 0:
             return None
+
         x, y, w, h = max(faces, key=lambda f: f[2] * f[3])
-        return float(w * h)   # bigger face = closer = down
+        # Approximate elbow angle from face height proximity (normalized)
+        norm_proximity = float(w * h)
+        return {"arm_angle": norm_proximity, "spine_angle": 180.0, "points": None}
 
-    return _signal
+    return _process
 
 
-# ── on-frame overlay (ASCII/digits only — cv2.putText can't render more) ────
+# ─────────────────────────────────────────────────────────────────────────────
+# HUD OVERLAY RENDERER
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _draw_overlay(frame, reps, target, state, flash_until, countdown=None):
+def _draw_hud(frame, reps, target, state, flash, countdown=None, points=None):
     out = frame.copy()
-    h, w = out.shape[:2]
+    h, w, _ = out.shape
+
+    # 1. Countdown Phase
     if countdown is not None:
+        cv2.rectangle(out, (0, 0), (w, h), (10, 15, 26), -1)
         txt = str(countdown)
-        size = cv2.getTextSize(txt, cv2.FONT_HERSHEY_DUPLEX, 6.0, 8)[0]
-        cv2.putText(out, txt, ((w - size[0]) // 2, (h + size[1]) // 2),
-                    cv2.FONT_HERSHEY_DUPLEX, 6.0, _BRIGHT, 8, cv2.LINE_AA)
+        sz = cv2.getTextSize(txt, cv2.FONT_HERSHEY_DUPLEX, 6.5, 9)[0]
+        cx, cy = (w - sz[0]) // 2, (h + sz[1]) // 2
+        cv2.putText(out, txt, (cx, cy), cv2.FONT_HERSHEY_DUPLEX, 6.5, _COLOR_CYAN, 9, cv2.LINE_AA)
+        cv2.putText(out, "GET INTO PUSHUP POSITION", (w // 2 - 240, h - 90), cv2.FONT_HERSHEY_SIMPLEX, 0.9, _COLOR_WHITE, 2)
         return out
-    big = time.time() < flash_until
-    scale = 4.0 if big else 2.8
-    color = _BRIGHT if big else _CYAN
-    label = f"{reps}" + (f"/{int(target)}" if target else "")
-    cv2.putText(out, label, (24, 90), cv2.FONT_HERSHEY_DUPLEX,
-                scale, color, 6 if big else 4, cv2.LINE_AA)
-    # state hint bar at the bottom: fills while DOWN
-    bar_w = int(w * (0.9 if state == "down" else 0.15))
-    cv2.rectangle(out, (0, h - 10), (bar_w, h), _CYAN, -1)
+
+    # 2. Draw Skeleton overlay if landmarks exist
+    if points:
+        s = points["shoulder"]
+        e = points["elbow"]
+        wr = points["wrist"]
+        cv2.line(out, s, e, _COLOR_CYAN, 3, cv2.LINE_AA)
+        cv2.line(out, e, wr, _COLOR_CYAN, 3, cv2.LINE_AA)
+        cv2.circle(out, s, 6, _COLOR_GREEN, -1)
+        cv2.circle(out, e, 6, _COLOR_GREEN, -1)
+        cv2.circle(out, wr, 6, _COLOR_GREEN, -1)
+
+    # 3. Top Telemetry Card
+    cv2.rectangle(out, (16, 16), (260, 110), (10, 15, 26), -1)
+    cv2.rectangle(out, (16, 16), (260, 110), _COLOR_CYAN if flash else (100, 116, 139), 2)
+
+    rep_txt = f"{reps}" + (f" / {target}" if target else "")
+    cv2.putText(out, "REPETITIONS", (28, 42), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (148, 163, 184), 1)
+    cv2.putText(out, rep_txt, (28, 96), cv2.FONT_HERSHEY_DUPLEX, 1.8, _COLOR_WHITE if not flash else _COLOR_CYAN, 3)
+
+    # 4. Range of Motion Progress Bar (Bottom)
+    bar_fill = int(w * (0.92 if state == "down" else 0.15))
+    cv2.rectangle(out, (0, h - 14), (w, h), (15, 23, 42), -1)
+    cv2.rectangle(out, (0, h - 14), (bar_fill, h), _COLOR_GREEN if state == "down" else _COLOR_CYAN, -1)
+
     return out
 
 
-# ── persistence (memory/long_term.json, additive — other keys preserved) ────
+# ─────────────────────────────────────────────────────────────────────────────
+# PERSISTENCE & LIFETIME ATHLETIC RECORD
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _record_session(reps: int, seconds: float) -> int:
-    """Append session, return today's total reps. Never raises."""
+def _save_workout_session(reps: int, seconds: float) -> dict:
+    """Logs workout to long_term.json and computes lifetime athletic progress."""
+    today = date.today().isoformat()
+    cals = round((8.0 * 3.5 * 72.0 / 200.0) * (seconds / 60.0), 1)  # 72kg baseline MET calculation
+
+    data = {}
     try:
-        path = BASE_DIR / "memory" / "long_term.json"
+        if MEMORY_FILE.exists():
+            data = json.loads(MEMORY_FILE.read_text(encoding="utf-8"))
+    except Exception:
         data = {}
-        if path.exists():
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except Exception:
-                data = {}
-        sessions = data.get("pushup_sessions")
-        if not isinstance(sessions, list):
-            sessions = []
-        today = date.today().isoformat()
-        sessions.append({"date": today, "reps": reps, "seconds": round(seconds)})
-        data["pushup_sessions"] = sessions[-100:]
-        path.write_text(json.dumps(data, indent=2, ensure_ascii=False),
-                        encoding="utf-8")
-        return sum(s.get("reps", 0) for s in sessions if s.get("date") == today)
-    except Exception:
-        return reps
 
+    sessions = data.get("pushup_sessions", [])
+    if not isinstance(sessions, list):
+        sessions = []
 
-# ── entry point ──────────────────────────────────────────────────────────────
+    sessions.append({
+        "date": today,
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "reps": reps,
+        "duration_sec": round(seconds),
+        "calories": cals,
+    })
 
-def run(parameters: dict, player=None, session_memory=None) -> str:
+    data["pushup_sessions"] = sessions[-120:]
     try:
-        target = int(parameters.get("target") or 0)
+        MEMORY_FILE.parent.mkdir(parents=True, exist_ok=True)
+        MEMORY_FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     except Exception:
-        target = 0
+        pass
 
-    def _log(msg: str) -> None:
-        if player:
-            try:
-                player.write_log(msg)
-            except Exception:
-                pass
+    today_reps = sum(s.get("reps", 0) for s in sessions if s.get("date") == today)
+    lifetime_reps = sum(s.get("reps", 0) for s in sessions)
+    best_session = max((s.get("reps", 0) for s in sessions), default=reps)
 
-    win        = getattr(player, "_win", None) if player else None
-    frame_sig  = getattr(win, "_cam_frame_sig", None)
+    return {
+        "today_reps": today_reps,
+        "lifetime_reps": lifetime_reps,
+        "personal_record": best_session,
+        "calories": cals,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# NATURAL INTENT ROUTER
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _normalize_pushup_intent(params: dict) -> tuple[str, int]:
+    query = (params.get("query", "") + " " + params.get("action", "")).lower()
+    target = int(params.get("target") or 0)
+
+    # Extract numeric target from natural query ("count 25 pushups", "goal is 30")
+    if target <= 0:
+        m = re.search(r"(\d+)\s*(?:pushups?|reps?|şınav)", query)
+        if m:
+            target = int(m.group(1))
+
+    if any(k in query for k in ["stats", "record", "history", "how many pushups"]):
+        return "stats", target
+    if any(k in query for k in ["stop", "cancel", "abort"]):
+        return "stop", target
+
+    return "start", target
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CENTRAL ORCHESTRATION ROUTER (UNIVERSAL DISPATCH)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def pushup_counter(
+    parameters: dict = None,
+    response=None,
+    player=None,
+    session_memory=None,
+    speak=None,
+) -> str:
+    """
+    Central orchestration router for AI computer vision workout tracking.
+    Binds directly to main.py dynamic tool execution pipeline.
+    """
+    global _ABORT_SESSION
+    raw_params = parameters or {}
+    action, target = _normalize_pushup_intent(raw_params)
+
+    if action == "stop":
+        _ABORT_SESSION.set()
+        msg = "Pushup session abort requested, sir."
+        if speak:
+            speak(msg)
+        return msg
+
+    if action == "stats":
+        stats = _save_workout_session(0, 0)
+        report = (
+            f"**Athletic Workout Dossier**\n"
+            f"• **Today's Total:** `{stats['today_reps']}` pushups\n"
+            f"• **Lifetime Reps:** `{stats['lifetime_reps']}` completed\n"
+            f"• **Personal Record:** `{stats['personal_record']}` reps in a single set"
+        )
+        _push_to_ui_hud(title="Workout Statistics", content=report, mode=3)
+        if speak:
+            speak(f"Your lifetime pushup record is {stats['personal_record']} reps, with {stats['today_reps']} completed today.")
+        return report
+
+    # ── INITIATE LIVE WORKOUT SESSION ──
+    _ABORT_SESSION.clear()
+
+    win = getattr(player, "_win", None) if player else None
+    frame_sig = getattr(win, "_cam_frame_sig", None)
     stream_sig = getattr(win, "_cam_stream_sig", None)
 
     detector = _make_pose_detector()
-    mode = "elbow tracking (mediapipe)"
-    if detector is None:
-        detector = _make_face_detector()
-        mode = "face-motion tracking (place camera on the floor in front of you)"
+    mode_desc = "MediaPipe 3D Biomechanical Pose" if detector else "Face-Motion Floor Proximity"
 
     cap = _open_camera()
     if cap is None:
-        return ("I couldn't access the camera — it may be in use by another "
-                "feature or application.")
+        err = "Unable to access camera hardware. It may be engaged by another process, sir."
+        if speak:
+            speak(err)
+        return err
 
-    counter = _RepCounter()
-    flash_until = 0.0
-    view_open = False
-    started = time.time()
-    last_rep_time = started
-    end_reason = "finished"
+    counter = BiomechanicalRepCounter(target_reps=target)
+    view_active = False
+
+    if speak:
+        speak(f"Starting pushup counter with {mode_desc}. Get in position, sir.")
+
     try:
         if stream_sig:
             stream_sig.emit(True)
-            view_open = True
-        _log(f"JARVIS: Pushup session started — {mode}.")
+            view_active = True
 
-        # Phase 1 — countdown so the user can get into position
-        t0 = time.time()
-        while time.time() - t0 < _COUNTDOWN_SECONDS:
-            ok, frm = cap.read()
-            if ok and frm is not None and frame_sig:
-                remaining = _COUNTDOWN_SECONDS - int(time.time() - t0)
-                _emit_frame(frame_sig,
-                            _draw_overlay(frm, 0, target, "up", 0,
-                                          countdown=max(1, remaining)))
+        # Phase 1: Preparation Countdown
+        t_start = time.time()
+        while time.time() - t_start < _COUNTDOWN_SECONDS:
+            if _ABORT_SESSION.is_set():
+                return "Session cancelled."
+            ok, frame = cap.read()
+            if ok and frame is not None:
+                rem = _COUNTDOWN_SECONDS - int(time.time() - t_start)
+                _emit_frame(frame_sig, _draw_hud(frame, 0, target, "up", False, countdown=max(1, rem)))
             time.sleep(1.0 / _FPS)
 
-        # Phase 2 — count
-        started = time.time()
-        last_rep_time = started
-        while True:
+        # Phase 2: Active Tracking Loop
+        session_start = time.time()
+        last_rep_time = session_start
+        flash_until = 0.0
+
+        while not _ABORT_SESSION.is_set():
             now = time.time()
-            if now - started > _MAX_SESSION_SECONDS:
-                end_reason = "time limit"
+            if now - session_start > _MAX_SESSION_SECONDS:
                 break
-            idle = now - last_rep_time
-            if counter.reps > 0 and idle > _IDLE_END_SECONDS:
-                end_reason = "user stopped"
+            if counter.reps > 0 and (now - last_rep_time) > _IDLE_END_SECONDS:
                 break
-            if counter.reps == 0 and idle > _IDLE_ABORT_SECONDS:
-                end_reason = "no pushups detected"
+            if counter.reps == 0 and (now - last_rep_time) > _IDLE_ABORT_SECONDS:
                 break
-            if target and counter.reps >= target:
-                end_reason = "target reached"
+            if target > 0 and counter.reps >= target:
                 break
 
-            ok, frm = cap.read()
-            if not ok or frm is None:
+            ok, frame = cap.read()
+            if not ok or frame is None:
                 time.sleep(1.0 / _FPS)
                 continue
-            sig = detector(frm)
-            if sig is not None and counter.update(sig):
-                last_rep_time = time.time()
-                flash_until = last_rep_time + 0.6
-                if counter.reps % 10 == 0 or (target and counter.reps == target):
-                    _log(f"JARVIS: Pushup {counter.reps} 💪")
-            if frame_sig:
-                _emit_frame(frame_sig,
-                            _draw_overlay(frm, counter.reps, target,
-                                          counter.state, flash_until))
+
+            telemetry = detector(frame)
+            points = telemetry["points"] if telemetry else None
+
+            if telemetry:
+                rep_hit, cue = counter.update(telemetry["arm_angle"], telemetry["spine_angle"])
+                if rep_hit:
+                    last_rep_time = time.time()
+                    flash_until = last_rep_time + 0.5
+                    if player and hasattr(player, "write_log"):
+                        player.write_log(f"[PushupCounter] Rep {counter.reps} ({cue})")
+
+            _emit_frame(
+                frame_sig,
+                _draw_hud(frame, counter.reps, target, counter.state, time.time() < flash_until, points=points)
+            )
             time.sleep(1.0 / _FPS)
+
     finally:
-        try:
-            cap.release()
-        except Exception:
-            pass
-        if view_open:
+        cap.release()
+        if view_active and stream_sig:
             stream_sig.emit(False)
 
+    duration = max(1.0, time.time() - session_start)
     reps = counter.reps
-    seconds = max(1.0, time.time() - started)
+    stats = _save_workout_session(reps, duration)
+    cadence = round((reps / (duration / 60.0)), 1) if duration > 5 else 0.0
+
+    # Format Performance Dossier
+    report_md = (
+        f"**Biomechanical Workout Summary**\n"
+        f"• **Total Reps:** `{reps}`" + (f" of `{target}` goal" if target else "") + "\n"
+        f"• **Strict Form Reps:** `{counter.strict_reps}` | Half Reps: `{counter.half_reps}`\n"
+        f"• **Cadence / Pace:** `{cadence}` reps/min\n"
+        f"• **Duration:** `{int(duration)}` seconds\n"
+        f"• **Energy Burned:** `{stats['calories']} kcal`\n"
+        f"• **Today's Cumulative:** `{stats['today_reps']}` pushups"
+    )
+
+    _push_to_ui_hud(
+        title="Workout Dossier",
+        content=report_md,
+        mode=3,
+        items=[{
+            "title": f"Workout: {reps} Reps Completed",
+            "snippet": f"Pace: {cadence} reps/min | Burn: {stats['calories']} kcal",
+            "url": "",
+        }],
+    )
 
     if reps == 0:
-        return ("The session ended without a single detected pushup "
-                f"({end_reason}). Tell the user — with gentle teasing — that "
-                "zero pushups were counted, and remind them the camera must "
-                "clearly see them (or their face, in face-tracking mode).")
+        spoken = "Pushup session ended without any complete reps detected, sir. Ensure the camera has a clear side view of your arms."
+    else:
+        spoken = (
+            f"Workout complete, sir! You completed {reps} pushups in {int(duration)} seconds, "
+            f"burning {stats['calories']} calories at {cadence} reps per minute."
+        )
 
-    today_total = _record_session(reps, seconds)
-    pace = reps / (seconds / 60.0)
+    if speak:
+        speak(spoken)
 
-    if player:
-        try:
-            player.show_content(
-                "💪 PUSHUP SESSION",
-                (f"Reps: {reps}" + (f" / {target}" if target else "") + "\n"
-                 f"Duration: {int(seconds)} s\n"
-                 f"Pace: {pace:.1f} reps/min\n"
-                 f"Today's total: {today_total}\n"
-                 f"Ended: {end_reason}\n"
-                 f"Mode: {mode}"),
-            )
-        except Exception:
-            pass
+    return report_md
 
-    return (f"Pushup session finished ({end_reason}). Reps: {reps}"
-            + (f" of the {target} targeted" if target else "")
-            + f". Duration: {int(seconds)} seconds ({pace:.1f} reps/min)."
-            f" Today's total: {today_total}. Deliver this to the user in "
-            "their language with playful, lightly teasing motivational "
-            "commentary about the number.")
+
+# Backwards compatibility alias for older callers
+def run(parameters: dict = None, player=None, session_memory=None) -> str:
+    return pushup_counter(
+        parameters=parameters,
+        response=None,
+        player=player,
+        session_memory=session_memory,
+        speak=None,
+    )

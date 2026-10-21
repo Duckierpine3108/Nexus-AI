@@ -1,65 +1,86 @@
-import subprocess
+"""
+Actions: Autonomous Software Development Agent (Production 3.8 Flagship Edition)
+End-to-end multi-file software engineering pipeline:
+  1. Full Gemini 3.8 Flash reasoning across Architect, Coder, and Debugger
+  2. Live dual-channel telemetry: Rich formatted terminal output + Main UI live cards
+  3. Cross-file API Contract enforcement (prevents method name mismatch bugs)
+  4. Multi-language dependency management (pip for Python, npm for Node/Web)
+  5. In-memory AST pre-flight verification & non-blocking execution (stdin protection)
+  6. Automated scaffolding (README.md, requirements.txt, .gitignore)
+  7. Automatic VS Code project launch
+"""
+
+import os
 import sys
 import json
 import re
 import time
+import shlex
+import ast
+import shutil
+import subprocess
 from pathlib import Path
 
-
-def get_base_dir():
+# ── Paths & Configuration ────────────────────────────────────────────────────
+def get_base_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent.parent
-
 
 BASE_DIR         = get_base_dir()
 API_CONFIG_PATH  = BASE_DIR / "config" / "api_keys.json"
 PROJECTS_DIR     = Path.home() / "Desktop" / "JarvisProjects"
 MAX_FIX_ATTEMPTS = 5
-MODEL_PLANNER = "gemini-3.8-flash"
-MODEL_WRITER  = "gemini-3.8-flash"
+
+# Full Flagship Engine: Gemini 3.8 Flash across all phases
+MODEL_PLANNER  = "gemini-3.8-flash"
+MODEL_WRITER   = "gemini-3.8-flash"
+MODEL_DEBUGGER = "gemini-3.8-flash"
+
+_FALLBACK_MODELS = [
+    "gemini-3.8-flash",
+    "gemini-3.5-flash-lite",  # Emergency fallback only if 3.8 encounters rate limits
+]
+
+_CACHED_CLIENT = None
 
 def _get_api_key() -> str:
     with open(API_CONFIG_PATH, "r", encoding="utf-8") as f:
         return json.load(f)["gemini_api_key"]
 
-
-def _get_model(model_name: str):
+def _get_client():
+    global _CACHED_CLIENT
+    if _CACHED_CLIENT is not None:
+        return _CACHED_CLIENT
     from google import genai
-    _c = genai.Client(api_key=_get_api_key())
+    _CACHED_CLIENT = genai.Client(api_key=_get_api_key())
+    return _CACHED_CLIENT
 
-    class _W:
-        def generate_content(self, contents):
-            # Fallback model priority queue to guarantee zero 503 failures
-            models_to_try = [
-                "gemini-3.8-flash",
-                "gemini-3.7-flash",
-                "gemini-3.6-flash",
-                "gemini-3.5-flash",
-                "gemini-2.5-flash",
-                "gemini-2.5-flash-lite",
-                "gemini-3.1-flash-lite",
-            ]
-            last_e = None
-            for m in models_to_try:
-                for attempt in range(2):
-                    try:
-                        return _c.models.generate_content(model=m, contents=contents)
-                    except Exception as e:
-                        last_e = e
-                        err_str = str(e)
-                        if "503" in err_str or "demand" in err_str:
-                            time.sleep(2 ** attempt)
-                            continue
+def _ai_call(prompt: str, preferred_model: str) -> str:
+    """Robust generation wrapper with automatic retry on rate limits."""
+    client = _get_client()
+    models_to_try = [preferred_model] + [m for m in _FALLBACK_MODELS if m != preferred_model]
+    last_err = None
 
-                        if "429" in err_str:
-                            time.sleep(5 * attempt)
-                            continue
-                        break
-            raise last_e
+    for model in models_to_try:
+        for attempt in range(2):
+            try:
+                response = client.models.generate_content(model=model, contents=prompt)
+                return (response.text or "").strip()
+            except Exception as e:
+                last_err = e
+                err_str = str(e).lower()
+                if "429" in err_str or "quota" in err_str:
+                    time.sleep(3 * (attempt + 1))
+                    continue
+                if "503" in err_str or "overloaded" in err_str:
+                    time.sleep(2)
+                    continue
+                if "404" in err_str or "not found" in err_str:
+                    break
+                break
 
-    return _W()
-
+    raise last_err or RuntimeError("DevAgent AI generation failed.")
 
 def _strip_fences(text: str) -> str:
     text = text.strip()
@@ -67,18 +88,69 @@ def _strip_fences(text: str) -> str:
     text = re.sub(r"\r?\n?```\s*$", "", text)
     return text.strip()
 
+# ── Live Telemetry Logger (Terminal + Main UI Live Channel) ───────────────────
+class Telemetry:
+    def __init__(self, player=None):
+        self.player = player
 
-def _is_rate_limit(error: Exception) -> bool:
-    msg = str(error).lower()
-    return "429" in msg or "quota" in msg or "resource_exhausted" in msg
+    def step(self, phase: str, detail: str):
+        # 1. Print formatted terminal log
+        print(f"\n[DevAgent] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        print(f"[DevAgent] 🧠 {phase}")
+        print(f"[DevAgent]    {detail}")
+        print(f"[DevAgent] ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
+        # 2. Stream to Live Main UI conversation log
+        if self.player and hasattr(self.player, "write_log"):
+            self.player.write_log(f"DEV: 🧠 [{phase}] {detail}")
 
+    def info(self, msg: str):
+        print(f"[DevAgent] ⚡ {msg}")
+        if self.player and hasattr(self.player, "write_log"):
+            self.player.write_log(f"DEV: {msg}")
+
+    def show_blueprint(self, plan: dict):
+        if not self.player or not hasattr(self.player, "show_content"):
+            return
+
+        proj_name = plan.get("project_name", "nexus_app")
+        entry = plan.get("entry_point", "main.py")
+        files = plan.get("files", [])
+        deps = plan.get("dependencies", [])
+
+        # Formatted hierarchical DeepSeek/AI Studio thinking display
+        card_content = (
+            f"🧠 REASONING & ARCHITECTURE BLUEPRINT\n\n"
+            f"• Project Identifier: {proj_name}\n\n"
+            f"• Execution Entry: {entry}\n\n"
+            f"• External Packages: {', '.join(deps) if deps else 'None (Standard Library)'}\n\n"
+            f"• File Dependency Graph ({len(files)} modules):\n"
+        )
+
+        for i, f in enumerate(files, 1):
+            exports_str = f" → Exports: {', '.join(f.get('exports', []))}" if f.get("exports") else ""
+            card_content += f"\n• [{i}/{len(files)}] {f['path']}{exports_str}\n  Purpose: {f.get('description', '')}\n"
+
+        try:
+            self.player.show_content(f"THINKING — {proj_name.upper()}", card_content)
+        except Exception as e:
+            print(f"[DevAgent] UI thinking card error: {e}")
+
+# ── Multi-Language Traceback & Error Parsing ─────────────────────────────────
 def _parse_traceback(output: str, project_files: list[str]) -> tuple[str | None, int | None]:
+    # Python tracebacks
+    py_pattern = re.compile(r'File ["\']([^"\']+\.py)["\'],\s+line\s+(\d+)', re.IGNORECASE)
+    py_matches = py_pattern.findall(output)
+    for raw_path, line_str in reversed(py_matches):
+        raw_name = Path(raw_path).name
+        for pf in project_files:
+            if Path(pf).name == raw_name or pf == raw_path or raw_path.endswith(pf):
+                return pf, int(line_str)
 
-    pattern = re.compile(r'File ["\']([^"\']+\.py)["\'],\s+line\s+(\d+)', re.IGNORECASE)
-    matches = pattern.findall(output)
-
-    for raw_path, line_str in reversed(matches):
+    # Node.js / JavaScript tracebacks
+    js_pattern = re.compile(r'(?:at\s+.*?\()?([a-zA-Z0-9_\-\.\/\\]+\.(?:js|ts|jsx|tsx)):(\d+)', re.IGNORECASE)
+    js_matches = js_pattern.findall(output)
+    for raw_path, line_str in reversed(js_matches):
         raw_name = Path(raw_path).name
         for pf in project_files:
             if Path(pf).name == raw_name or pf == raw_path or raw_path.endswith(pf):
@@ -86,543 +158,395 @@ def _parse_traceback(output: str, project_files: list[str]) -> tuple[str | None,
 
     return None, None
 
-
 def _classify_error(output: str) -> str:
-
     low = output.lower()
-
-    if any(x in low for x in ("no module named", "modulenotfounderror", "importerror")):
+    if any(x in low for x in ("no module named", "modulenotfounderror", "cannot find module")):
         return "dependency_error"
-
-    if "syntaxerror" in low or "invalid syntax" in low:
+    if any(x in low for x in ("syntaxerror", "invalid syntax", "unexpected token")):
         return "syntax_error"
-    
-    if "cannot import" in low or "importerror" in low:
+    if any(x in low for x in ("cannot import", "importerror", "require is not defined", "is not a function")):
         return "import_error"
-
-    if any(x in low for x in (
-        "traceback", "exception", "error:", "nameerror", "typeerror",
-        "attributeerror", "valueerror", "keyerror", "indexerror",
-        "zerodivisionerror", "filenotfounderror", "permissionerror",
-    )):
+    if any(x in low for x in ("traceback", "exception", "error:", "referenceerror", "typeerror", "valueerror")):
         return "runtime_error"
-
     return "none"
 
-
 def _has_error(output: str, run_command: str) -> bool:
-    
     low = output.lower()
-
-    if "timed out" in low:
+    if "running continuously" in low:
         return False
-
     if not output.strip():
         return False
+    return _classify_error(output) != "none"
 
-    error_type = _classify_error(output)
-    return error_type != "none"
+# ── Architectural Planning with Strict API Contracts ─────────────────────────
+def _plan_project(description: str, language: str, tele: Telemetry) -> dict:
+    tele.step("Phase 1: Deep Architectural Planning", f"Designing multi-file system contract for: '{description[:70]}...'")
 
-class RateLimitError(Exception):
-    pass
-
-
-def _plan_project(description: str, language: str) -> dict:
-    model = _get_model(MODEL_PLANNER)
-
-    prompt = f"""You are a senior software architect. Create a minimal, complete file plan for this project.
+    prompt = f"""You are a Principal Software Architect. Design a production-grade, highly reliable multi-file application.
 
 Language: {language}
 Description: {description}
 
-Return ONLY valid JSON — no markdown, no explanation:
+Return ONLY a valid JSON object without markdown formatting:
 {{
   "project_name": "snake_case_name",
   "entry_point": "main.py",
   "files": [
     {{
-      "path": "main.py",
-      "description": "Entry point — what it does and which modules it imports",
-      "imports": ["utils.helpers", "core.engine"]
+      "path": "static/audio.js",
+      "description": "Exposes SoundManager class with methods: init(), playLaser(), playExplosion()",
+      "exports": ["class SoundManager {{ init(), playLaser(), playExplosion() }}"],
+      "imports": []
     }},
     {{
-      "path": "utils/helpers.py",
-      "description": "Helper utilities — what functions it exposes",
-      "imports": []
+      "path": "static/game.js",
+      "description": "Game canvas engine. Instantiates SoundManager and handles loop",
+      "exports": ["class Game"],
+      "imports": ["static/audio.js"]
     }}
   ],
   "run_command": "python main.py",
-  "dependencies": ["requests"]
+  "dependencies": []
 }}
 
-Critical rules:
-1. List files in DEPENDENCY ORDER — files with no imports come first, entry point comes last.
-2. The "imports" field must list every other project module this file imports (dot-notation, e.g. "utils.helpers").
-3. Keep it minimal — only files truly needed.
-4. Entry point must be in the files list.
-5. Use relative paths only (e.g. "utils/helpers.py", not absolute paths).
-6. Standard library modules (os, sys, json, etc.) do NOT go in "dependencies".
+Strict Architectural Rules:
+1. List files strictly in DEPENDENCY ORDER (files with no dependencies first, entry point last).
+2. For every file, explicitly state in 'exports' the exact class names, functions, and methods it exposes.
+3. Every file that imports another file MUST strictly use the exact method names listed in 'exports'.
+4. Standard libraries (sys, os, json, math, fs, path) must NOT be included in dependencies.
+5. Use relative paths only."""
 
-JSON:"""
-
+    raw = _ai_call(prompt, MODEL_PLANNER)
+    clean_json = _strip_fences(raw)
     try:
-        response = model.generate_content(prompt)
-        raw = _strip_fences(response.text)
-        return json.loads(raw)
-    except json.JSONDecodeError as e:
-        raise ValueError(f"Planner returned invalid JSON: {e}\nRaw: {response.text[:300]}")
-    except Exception as e:
-        if _is_rate_limit(e):
-            raise RateLimitError(str(e))
-        raise
+        plan = json.loads(clean_json)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", clean_json, re.DOTALL)
+        if match:
+            plan = json.loads(match.group(0))
+        else:
+            raise ValueError("Architect could not generate valid project specification.")
 
-def _write_file(
-    file_info: dict,
-    project_description: str,
-    all_files: list[dict],
-    language: str,
-    project_dir: Path,
-    already_written: dict[str, str],
-) -> str:
-    model = _get_model(MODEL_WRITER)
+    # Display live blueprint on UI Content Card
+    blueprint_text = f"Project: {plan.get('project_name')}\nEntry Point: {plan.get('entry_point')}\nRun Command: {plan.get('run_command')}\n\nArchitecture Plan:\n"
+    for f in plan.get("files", []):
+        blueprint_text += f"\n📄 {f['path']}\n   Purpose: {f.get('description', '')}\n   Exports: {', '.join(f.get('exports', []))}\n"
+    tele.show_blueprint(plan)
 
-    file_path = file_info["path"]
-    file_desc = file_info.get("description", "")
-    file_imports = file_info.get("imports", [])
+    return plan
 
-    file_list = "\n".join(
-        f"  [{i+1}] {f['path']}: {f.get('description', '')}"
-        for i, f in enumerate(all_files)
-    )
-
-    dependency_context = ""
-    for dep_dotted in file_imports:
-        dep_path = dep_dotted.replace(".", "/") + ".py"
-        if dep_path in already_written:
-            code_snippet = already_written[dep_path][:2000]
-            dependency_context += f"\n\n--- {dep_path} (you must import from this) ---\n{code_snippet}"
-
-    lang_rules = ""
-    if language.lower() == "python":
-        lang_rules = """
-Python-specific rules:
-- Use type hints for all function signatures.
-- Add docstrings for all public functions and classes.
-- Use if __name__ == "__main__": guard in the entry point.
-- For relative imports within the project, use: from utils.helpers import foo  (match the project structure exactly).
-- Do NOT use implicit relative imports (from . import ...) unless it's a proper package with __init__.py.
-- If this is a package subdirectory, create __init__.py files where needed."""
-    elif language.lower() in ("javascript", "typescript", "js", "ts"):
-        lang_rules = """
-JS/TS-specific rules:
-- Use ES modules (import/export), not CommonJS (require).
-- Add JSDoc comments for all exported functions.
-- Handle promise rejections with try/catch in async functions."""
-
-    prompt = f"""You are a senior {language} developer writing production-quality code for a real project.
-
-Project goal: {project_description}
-
-Complete project file structure (in dependency order):
-{file_list}
-
-{f"Dependencies this file must import from other project files:{dependency_context}" if dependency_context else ""}
-
-Your task: Write the complete, working code for: {file_path}
-Purpose of this file: {file_desc}
-{f"This file imports from: {', '.join(file_imports)}" if file_imports else "This file has no project-internal imports."}
-
-{lang_rules}
-
-General rules:
-- Output ONLY raw code. Absolutely no explanation, no markdown, no triple backticks.
-- Write COMPLETE, RUNNABLE code — no placeholders, no "# TODO", no "pass" stubs.
-- Every import must either be from the standard library, listed dependencies, or the project files shown above.
-- Match import paths EXACTLY to the file paths in the project structure (e.g. if file is "utils/helpers.py", import as "from utils.helpers import ...").
-- Use proper error handling (try/except) where I/O or network calls are made.
-- The code must work correctly when the project entry point is run from the project root directory.
-
-Code for {file_path}:"""
-
-    try:
-        response = model.generate_content(prompt)
-        code = _strip_fences(response.text)
-
-        full_path = project_dir / file_path
-        full_path.parent.mkdir(parents=True, exist_ok=True)
-        full_path.write_text(code, encoding="utf-8")
-
-        print(f"[DevAgent] ✅ Written: {file_path} ({len(code)} chars)")
-        return code
-
-    except Exception as e:
-        if _is_rate_limit(e):
-            raise RateLimitError(str(e))
-        raise
-
-def _install_dependencies(dependencies: list[str], project_dir: Path) -> str:
+# ── Multi-Language Dependency Management ─────────────────────────────────────
+def _install_dependencies(dependencies: list[str], language: str, project_dir: Path, tele: Telemetry) -> str:
     if not dependencies:
-        return "No external dependencies."
+        return "No external dependencies required."
+
+    lang = language.lower()
+    is_node = any(x in lang for x in ("node", "javascript", "typescript", "js", "ts"))
+
+    if is_node:
+        if shutil.which("npm"):
+            tele.info(f"Installing Node packages via npm: {', '.join(dependencies)}")
+            try:
+                cmd = ["npm", "install"] + dependencies
+                res = subprocess.run(cmd, cwd=str(project_dir), capture_output=True, text=True, timeout=180, shell=(os.name == "nt"))
+                return f"Installed npm packages: {', '.join(dependencies)}" if res.returncode == 0 else f"npm warning: {res.stderr[:200]}"
+            except Exception as e:
+                return f"npm install error: {e}"
+        return "npm not found on system PATH."
 
     to_install = []
     for dep in dependencies:
         pkg_name = re.split(r"[>=<!]", dep)[0].strip()
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "show", pkg_name],
-            capture_output=True, text=True
-        )
-        if result.returncode != 0:
+        res = subprocess.run([sys.executable, "-m", "pip", "show", pkg_name], capture_output=True, text=True)
+        if res.returncode != 0:
             to_install.append(dep)
         else:
-            print(f"[DevAgent] ✓ Already installed: {pkg_name}")
+            tele.info(f"Dependency satisfied: {pkg_name}")
 
     if not to_install:
-        return f"All dependencies already installed: {', '.join(dependencies)}"
+        return f"All Python dependencies satisfied: {', '.join(dependencies)}"
 
-    print(f"[DevAgent] 📦 Installing: {to_install}")
+    tele.info(f"Installing missing Python packages via pip: {to_install}")
     try:
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install"] + to_install,
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-            timeout=120, cwd=str(project_dir)
-        )
-        if result.returncode == 0:
-            return f"Installed: {', '.join(to_install)}"
-        return f"Install warning (non-fatal): {result.stderr[:200]}"
-    except subprocess.TimeoutExpired:
-        return "Dependency install timed out (non-fatal)."
+        res = subprocess.run([sys.executable, "-m", "pip", "install"] + to_install, cwd=str(project_dir), capture_output=True, text=True, timeout=180)
+        return f"Installed dependencies: {', '.join(to_install)}" if res.returncode == 0 else f"pip warning: {res.stderr[:200]}"
     except Exception as e:
-        return f"Install error (non-fatal): {e}"
+        return f"pip install error: {e}"
 
-def _open_vscode(project_dir: Path) -> bool:
-    vscode_candidates = [
+def _try_auto_install(error_output: str, language: str, project_dir: Path, tele: Telemetry) -> bool:
+    if "python" in language.lower():
+        match = re.search(r"No module named ['\"]([a-zA-Z0-9_\-\.]+)['\"]", error_output, re.IGNORECASE)
+        if match:
+            pkg = match.group(1).split(".")[0].replace("_", "-")
+            tele.info(f"Auto-installing missing module: {pkg}")
+            res = subprocess.run([sys.executable, "-m", "pip", "install", pkg], cwd=str(project_dir), capture_output=True, text=True, timeout=90)
+            return res.returncode == 0
+    return False
+
+# ── Automated Project Scaffolding ────────────────────────────────────────────
+def _generate_scaffolding(project_dir: Path, proj_name: str, description: str, language: str, dependencies: list[str], run_command: str):
+    gitignore = project_dir / ".gitignore"
+    if not gitignore.exists():
+        gitignore.write_text(
+            "__pycache__/\n*.py[cod]\n*.so\n.env\n.venv\nvenv/\nnode_modules/\n.vscode/\n.idea/\ndist/\nbuild/\n",
+            encoding="utf-8"
+        )
+
+    if "python" in language.lower() and dependencies:
+        req = project_dir / "requirements.txt"
+        if not req.exists():
+            req.write_text("\n".join(dependencies) + "\n", encoding="utf-8")
+
+    readme = project_dir / "README.md"
+    if not readme.exists():
+        content = (
+            f"# {proj_name}\n\n"
+            f"> {description}\n\n"
+            f"## System Architecture\n"
+            f"- **Core Engine**: {language.capitalize()}\n"
+            f"- **Dependencies**: {', '.join(dependencies) if dependencies else 'Standard Library'}\n\n"
+            f"## How to Run\n"
+            f"```bash\n{run_command}\n```\n\n"
+            f"---\n*Engineered autonomously by Nexus AI DevAgent (Gemini 3.8 Flash).*\n"
+        )
+        readme.write_text(content, encoding="utf-8")
+
+# ── Code Writer with In-Memory AST Linting ────────────────────────────────────
+def _write_file(file_info: dict, project_desc: str, all_files: list[dict], language: str, project_dir: Path, already_written: dict[str, str], tele: Telemetry) -> str:
+    file_path = file_info["path"]
+    file_desc = file_info.get("description", "")
+    file_exports = file_info.get("exports", [])
+    file_imports = file_info.get("imports", [])
+
+    file_list = "\n".join(f"  - {f['path']}: {f.get('description', '')} (Exports: {', '.join(f.get('exports', []))})" for f in all_files)
+
+    dep_context = ""
+    for dep in file_imports:
+        dep_p = dep if dep.endswith((".py", ".js", ".html", ".css")) else dep + (".py" if "python" in language.lower() else ".js")
+        if dep_p in already_written:
+            snippet = already_written[dep_p][:2600]
+            dep_context += f"\n--- {dep_p} (Actual code implemented) ---\n{snippet}\n"
+
+    prompt = f"""You are a Lead Software Engineer writing production code with Gemini 3.8 Flash.
+
+Project: {project_desc}
+All project files and their strict contracts:
+{file_list}
+{dep_context}
+
+Write COMPLETE, FLAWLESS, RUNNABLE code for: {file_path}
+Purpose: {file_desc}
+Contracts this file must fulfill: {', '.join(file_exports)}
+
+Engineering Directives:
+- Output ONLY raw executable code. Zero explanation, zero markdown backticks.
+- Never use '# TODO' or 'pass' stubs. Implement every function fully.
+- Ensure all variable, method, and function calls match the exact method signatures in the sibling files above.
+- Ensure cross-file method names match 100%.
+
+Code for {file_path}:"""
+
+    tele.info(f"Synthesizing '{file_path}' with Gemini 3.8 Flash...")
+    code = _strip_fences(_ai_call(prompt, MODEL_WRITER))
+
+    # In-memory AST pre-flight verification for Python files
+    if "python" in language.lower() and file_path.endswith(".py"):
+        try:
+            ast.parse(code)
+            tele.info(f"AST verification passed: '{file_path}' syntax is valid.")
+        except SyntaxError as e:
+            tele.info(f"AST caught syntax error in '{file_path}': {e}. Auto-refining...")
+            fix_prompt = f"Fix this Python syntax error ({e}) in the code below. Return ONLY valid code:\n{code}"
+            code = _strip_fences(_ai_call(fix_prompt, MODEL_PLANNER))
+
+    full_path = project_dir / file_path
+    full_path.parent.mkdir(parents=True, exist_ok=True)
+    full_path.write_text(code, encoding="utf-8")
+    return code
+
+# ── Safe Process Execution ───────────────────────────────────────────────────
+def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
+    print(f"[DevAgent] 🚀 Running: {run_command}")
+    try:
+        parts = shlex.split(run_command, posix=(os.name != "nt"))
+        if parts and parts[0].lower() in ("python", "python3"):
+            parts[0] = sys.executable
+
+        res = subprocess.run(
+            parts,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            cwd=str(project_dir),
+            stdin=subprocess.DEVNULL,
+        )
+
+        stdout = res.stdout.strip()
+        stderr = res.stderr.strip()
+
+        combined = []
+        if stdout: combined.append(f"STDOUT:\n{stdout}")
+        if stderr: combined.append(f"STDERR:\n{stderr}")
+
+        if res.returncode != 0 and not combined:
+            return f"Process failed with exit code {res.returncode}."
+
+        return "\n\n".join(combined) if combined else "Ran successfully with zero errors."
+
+    except subprocess.TimeoutExpired:
+        return f"Running continuously (timed out after {timeout}s) — application/server is active."
+    except Exception as e:
+        return f"Execution error: {e}"
+
+def _open_vscode(project_dir: Path, tele: Telemetry) -> bool:
+    candidates = [
         "code",
         rf"C:\Users\{Path.home().name}\AppData\Local\Programs\Microsoft VS Code\bin\code.cmd",
         r"C:\Program Files\Microsoft VS Code\bin\code.cmd",
     ]
-    for cmd in vscode_candidates:
+    for cmd in candidates:
         try:
-            subprocess.Popen(
-                [cmd, str(project_dir)],
-                shell=True,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            time.sleep(1.5)
-            print(f"[DevAgent] 💻 VSCode opened: {project_dir}")
+            subprocess.Popen([cmd, str(project_dir)], shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            tele.info(f"VS Code workspace opened: {project_dir.name}")
             return True
         except Exception:
             continue
     return False
 
-def _run_project(run_command: str, project_dir: Path, timeout: int = 30) -> str:
-    print(f"[DevAgent] 🚀 Running: {run_command}")
-    try:
-        parts = run_command.split()
-        if parts[0].lower() == "python":
-            parts[0] = sys.executable
-
-        result = subprocess.run(
-            parts,
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-            timeout=timeout,
-            cwd=str(project_dir)
-        )
-
-        stdout = result.stdout.strip()
-        stderr = result.stderr.strip()
-
-        combined_parts = []
-        if stdout:
-            combined_parts.append(f"STDOUT:\n{stdout}")
-        if stderr:
-            combined_parts.append(f"STDERR:\n{stderr}")
-
-        return "\n\n".join(combined_parts) if combined_parts else "Ran with no output."
-
-    except subprocess.TimeoutExpired:
-        return f"Timed out after {timeout}s — long-running app (server/GUI) is likely working."
-    except FileNotFoundError as e:
-        return f"Command not found: {e}"
-    except Exception as e:
-        return f"Run error: {e}"
-
-def _try_auto_install(error_output: str, project_dir: Path) -> bool:
-    """ModuleNotFoundError varsa eksik paketi otomatik kurmaya çalışır."""
-    pattern = re.compile(
-        r"No module named ['\"]([a-zA-Z0-9_\-\.]+)['\"]", re.IGNORECASE
-    )
-    match = pattern.search(error_output)
-    if not match:
-        return False
-
-    pkg = match.group(1).replace("_", "-").split(".")[0]
-    print(f"[DevAgent] 🔧 Auto-installing missing package: {pkg}")
-    try:
-        result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", pkg],
-            capture_output=True, text=True,
-            encoding="utf-8", errors="replace",
-            timeout=60, cwd=str(project_dir)
-        )
-        return result.returncode == 0
-    except Exception:
-        return False
-
-def _fix_files(
-    error_output: str,
-    project_description: str,
-    all_files: list[dict],
-    file_codes: dict[str, str],
-    language: str,
-    project_dir: Path,
-    entry_point: str,
-) -> dict[str, str]:
-
-    model = _get_model(MODEL_PLANNER)
-
+# ── Diagnostic Self-Repair Loop ──────────────────────────────────────────────
+def _fix_files(error_output: str, project_desc: str, all_files: list[dict], file_codes: dict[str, str], language: str, project_dir: Path, entry_point: str, tele: Telemetry) -> dict[str, str]:
     error_file, error_line = _parse_traceback(error_output, list(file_codes.keys()))
     error_type = _classify_error(error_output)
 
-    files_to_fix: list[str] = []
+    target_file = error_file or entry_point
+    current_code = file_codes.get(target_file, "")
+    line_hint = f"\nError detected near line {error_line}." if error_line else ""
 
-    if error_file:
-        files_to_fix.append(error_file)
-        if error_type == "import_error":
-            for fi in all_files:
-                if error_file.replace("/", ".").replace(".py", "") in fi.get("imports", []):
-                    p = fi["path"]
-                    if p not in files_to_fix:
-                        files_to_fix.append(p)
-    else:
-        files_to_fix.append(entry_point)
+    tele.step("Diagnostic Self-Repair", f"Fixing {error_type} in '{target_file}'...")
 
-    updated_codes: dict[str, str] = {}
+    prompt = f"""You are a Lead Debugging Engineer using Gemini 3.8 Flash. Fix the broken file.
 
-    for fix_path in files_to_fix:
-        current_code = file_codes.get(fix_path, "")
+Project: {project_desc}
+Target file: {target_file}{line_hint}
+Error category: {error_type}
 
-        other_ctx = ""
-        for fp, code in file_codes.items():
-            if fp != fix_path and code:
-                snippet = code[:1500] + ("..." if len(code) > 1500 else "")
-                other_ctx += f"\n--- {fp} ---\n{snippet}\n"
+Traceback:
+{error_output[:2800]}
 
-        line_hint = f"\nError appears to be near line {error_line} in this file." if (
-            error_line and fix_path == error_file
-        ) else ""
-
-        prompt = f"""You are an expert {language} debugger. Fix the broken file below.
-
-Project goal: {project_description}
-
-All project files:
-{chr(10).join(f"  - {f['path']}: {f.get('description', '')}" for f in all_files)}
-
-Other files for context (read-only — fix only the target file):
-{other_ctx[:3500]}
-
-File to fix: {fix_path}{line_hint}
-Error type: {error_type}
-
-Error output:
-{error_output[:2500]}
-
-Current (broken) code:
+Current code:
 {current_code}
 
-Rules:
-- Output ONLY the complete fixed code. No explanation, no markdown, no backticks.
-- Fix ALL errors visible in the error output.
-- Keep all existing correct logic — do not remove working features.
-- Ensure import paths match the actual project file structure exactly.
-- Do NOT introduce new bugs or remove error handling.
+Fixing Rules:
+- Return ONLY the complete fixed code. No explanation, no markdown backticks.
+- Preserve all existing functionality while resolving the error.
+- Ensure cross-file imports and method names match exactly.
 
-Fixed code for {fix_path}:"""
+Fixed code for {target_file}:"""
 
-        try:
-            response = model.generate_content(prompt)
-            fixed = _strip_fences(response.text)
+    fixed_code = _strip_fences(_ai_call(prompt, MODEL_DEBUGGER))
+    full_path = project_dir / target_file
+    full_path.parent.mkdir(parents=True, exist_ok=True)
+    full_path.write_text(fixed_code, encoding="utf-8")
+    return {target_file: fixed_code}
 
-            full_path = project_dir / fix_path
-            full_path.parent.mkdir(parents=True, exist_ok=True)
-            full_path.write_text(fixed, encoding="utf-8")
+# ── Central Builder Engine ───────────────────────────────────────────────────
+def _build_project(description: str, language: str, project_name: str, timeout: int, speak=None, player=None) -> str:
+    tele = Telemetry(player=player)
 
-            updated_codes[fix_path] = fixed
-            print(f"[DevAgent] 🔧 Fixed: {fix_path}")
-
-        except Exception as e:
-            if _is_rate_limit(e):
-                raise RateLimitError(str(e))
-            print(f"[DevAgent] ⚠️ Could not fix {fix_path}: {e}")
-
-    return updated_codes
-
-def _build_project(
-    description: str,
-    language: str,
-    project_name: str,
-    timeout: int,
-    speak=None,
-    player=None,
-) -> str:
-
-    def log(msg: str):
-        print(f"[DevAgent] {msg}")
-        if player:
-            player.write_log(f"[DevAgent] {msg}")
-
-    log("Planning project structure...")
     try:
-        plan = _plan_project(description, language)
-    except RateLimitError:
-        msg = "Rate limit reached, sir. Please try again in a moment."
-        if speak: speak(msg)
-        return msg
-    except ValueError as e:
-        msg = f"Planning failed: {e}"
-        if speak: speak(msg)
-        return msg
+        plan = _plan_project(description, language, tele)
+    except Exception as e:
+        err = f"Architect planning failed: {e}"
+        if speak: speak("Planning failed, sir.")
+        tele.info(err)
+        return err
 
-    proj_name    = project_name or plan.get("project_name", "jarvis_project")
-    proj_name    = re.sub(r"[^\w\-]", "_", proj_name)
-    project_dir  = PROJECTS_DIR / proj_name
+    clean_name = re.sub(r"[^\w\-]", "_", project_name or plan.get("project_name", "nexus_app"))
+    project_dir = PROJECTS_DIR / clean_name
     project_dir.mkdir(parents=True, exist_ok=True)
 
-    files        = plan.get("files", [])
-    entry_point  = plan.get("entry_point", "main.py")
-    run_command  = plan.get("run_command", f"python {entry_point}")
+    files = plan.get("files", [])
+    entry_point = plan.get("entry_point", "main.py")
+    run_command = plan.get("run_command", f"python {entry_point}")
     dependencies = plan.get("dependencies", [])
 
-    log(f"Project: {proj_name} | Files: {len(files)} | Entry: {entry_point}")
+    tele.step("Phase 2: Code Synthesis", f"Generating {len(files)} files via Gemini 3.8 Flash...")
 
-    def _dep_sort_key(fi: dict) -> int:
-        return len(fi.get("imports", []))
+    # Write files in strict dependency order
+    file_codes = {}
+    for fi in sorted(files, key=lambda x: len(x.get("imports", []))):
+        f_path = fi.get("path")
+        if not f_path: continue
+        try:
+            code = _write_file(fi, description, files, language, project_dir, file_codes, tele)
+            file_codes[f_path] = code
+            time.sleep(0.2)
+        except Exception as e:
+            tele.info(f"Warning on {f_path}: {e}")
 
-    sorted_files = sorted(files, key=_dep_sort_key)
-
-    file_codes: dict[str, str] = {}
-
-    for file_info in sorted_files:
-        file_path = file_info.get("path", "")
-        if not file_path:
-            continue
-
-        log(f"Writing {file_path}...")
-        for attempt in range(2):
-            try:
-                code = _write_file(
-                    file_info=file_info,
-                    project_description=description,
-                    all_files=files,
-                    language=language,
-                    project_dir=project_dir,
-                    already_written=file_codes,
-                )
-                file_codes[file_path] = code
-                time.sleep(0.4)
-                break
-            except RateLimitError:
-                if attempt == 0:
-                    log("Rate limit — waiting 20s...")
-                    time.sleep(20)
-                else:
-                    log(f"Rate limit retry failed for {file_path}, skipping.")
-            except Exception as e:
-                log(f"Failed to write {file_path}: {e}")
-                break
-
-    if not file_codes:
-        msg = "I could not write any project files, sir."
-        if speak: speak(msg)
-        return msg
-
+    # Scaffolding & Dependencies
+    _generate_scaffolding(project_dir, clean_name, description, language, dependencies, run_command)
     if dependencies:
-        install_result = _install_dependencies(dependencies, project_dir)
-        log(install_result)
+        tele.info(_install_dependencies(dependencies, language, project_dir, tele))
 
-    _open_vscode(project_dir)
+    _open_vscode(project_dir, tele)
 
-    last_output   = ""
-    auto_installs = 0  
+    # Phase 3: Diagnostic verification loop
+    tele.step("Phase 3: Runtime Verification", f"Executing '{run_command}'...")
+    last_output = ""
+    auto_installs = 0
 
     for attempt in range(1, MAX_FIX_ATTEMPTS + 1):
-        log(f"Running project (attempt {attempt}/{MAX_FIX_ATTEMPTS})...")
+        tele.info(f"Execution test attempt {attempt}/{MAX_FIX_ATTEMPTS}...")
         last_output = _run_project(run_command, project_dir, timeout)
-        log(f"Output preview: {last_output[:150]}")
 
         if not _has_error(last_output, run_command):
-            msg = (
-                f"Project '{proj_name}' is working, sir. "
-                f"Built in {attempt} attempt{'s' if attempt > 1 else ''}. "
-                f"Saved to: {project_dir}"
-            )
+            msg = f"Project '{clean_name}' successfully built and verified in {attempt} attempt(s)."
+            tele.step("Project Complete", msg)
             if speak: speak(msg)
-            return f"{msg}\n\nOutput:\n{last_output}"
+            return f"{msg}\nSaved to: {project_dir}\n\nExecution Output:\n{last_output}"
 
         if attempt == MAX_FIX_ATTEMPTS:
             break
 
         error_type = _classify_error(last_output)
         if error_type == "dependency_error" and auto_installs < 3:
-            installed = _try_auto_install(last_output, project_dir)
-            if installed:
+            if _try_auto_install(last_output, language, project_dir, tele):
                 auto_installs += 1
-                log("Missing dependency installed, retrying...")
-                time.sleep(1)
+                tele.info("Missing dependency auto-installed. Retrying...")
                 continue
 
-        log(f"Fixing errors (type: {error_type})...")
+        tele.info(f"Self-repair triggered: resolving {error_type}...")
         try:
-            updated = _fix_files(
-                error_output=last_output,
-                project_description=description,
-                all_files=files,
-                file_codes=file_codes,
-                language=language,
-                project_dir=project_dir,
-                entry_point=entry_point,
-            )
+            updated = _fix_files(last_output, description, files, file_codes, language, project_dir, entry_point, tele)
             file_codes.update(updated)
-            time.sleep(1)
-        except RateLimitError:
-            msg = "Rate limit reached during fix. Project saved, check it manually in VSCode."
-            if speak: speak(msg)
-            return msg
+            time.sleep(0.5)
         except Exception as e:
-            log(f"Fix step failed: {e}")
+            tele.info(f"Self-repair step failed: {e}")
 
-    msg = (
-        f"I couldn't fully fix '{proj_name}' after {MAX_FIX_ATTEMPTS} attempts, sir. "
-        f"Project is saved at {project_dir} — open it in VSCode and check manually."
-    )
-    if speak: speak(msg)
-    return f"{msg}\n\nLast error:\n{last_output[:600]}"
+    fail_msg = f"Could not fully resolve '{clean_name}' after {MAX_FIX_ATTEMPTS} attempts. Project saved at: {project_dir}"
+    tele.info(fail_msg)
+    if speak: speak(fail_msg)
+    return f"{fail_msg}\n\nLast Output:\n{last_output[:800]}"
 
-
-def dev_agent(
-    parameters: dict,
-    response=None,
-    player=None,
-    session_memory=None,
-    speak=None,
-) -> str:
-    p            = parameters or {}
-    description  = p.get("description", "").strip()
-    language     = p.get("language", "python").strip()
+# ── Tool Entry Point ─────────────────────────────────────────────────────────
+def dev_agent(parameters: dict | None = None, response=None, player=None, session_memory=None, speak=None) -> str:
+    p = parameters or {}
+    description = p.get("description", "").strip()
+    language = p.get("language", "python").strip()
     project_name = p.get("project_name", "").strip()
-    timeout      = int(p.get("timeout", 30))
+    timeout = int(p.get("timeout", 30))
 
     if not description:
-        return "Please describe the project you want me to build, sir."
+        return "Please describe what application you want me to engineer, sir."
 
     return _build_project(
-        description  = description,
-        language     = language,
-        project_name = project_name,
-        timeout      = timeout,
-        speak        = speak,
-        player       = player,
+        description=description,
+        language=language,
+        project_name=project_name,
+        timeout=timeout,
+        speak=speak,
+        player=player,
     )

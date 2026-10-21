@@ -11,11 +11,10 @@ def weather_action(
     when     = parameters.get("time", "today")  
 
     if not city or not isinstance(city, str) or not city.strip():
-        msg = "Sir, the city is missing for the weather report."
-        _log(msg, player)
-        return msg
-
-    city = city.strip()
+        city = "Lahore" # Default fallback city
+    else:
+        city = city.strip()
+        
     when = (when or "today").strip()
 
     search_query  = f"weather in {city} {when}"
@@ -38,8 +37,6 @@ def weather_action(
             session_memory.set_last_search(query=search_query, response=msg)
         except Exception:
             pass
-
-    return msg
 
 
 def _log(message: str, player=None) -> None:

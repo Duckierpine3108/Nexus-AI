@@ -1,273 +1,296 @@
+"""
+Actions: Application Launcher & Window Focus Manager (Production Windows Edition)
+Robust 5-stage discovery:
+  1. Active Window Focus (Bring to front if already running)
+  2. Protocol & URI Schemes (UWP / Modern Windows Apps)
+  3. Windows Registry App Paths (HKLM & HKCU)
+  4. Start Menu Shortcut Crawler (.lnk & .url)
+  5. System PATH & Explorer Fallbacks
+"""
+
+import os
+import sys
 import time
-import subprocess
-import platform
 import shutil
+import difflib
+import subprocess
+from pathlib import Path
 
-try:
-    import psutil
-    _PSUTIL = True
-except ImportError:
-    _PSUTIL = False
+# ── Windows API Imports via ctypes ───────────────────────────────────────────
+import ctypes
+from ctypes import wintypes
 
-_SYSTEM = platform.system()
+user32 = ctypes.windll.user32 if os.name == "nt" else None
 
-_APP_ALIASES: dict[str, dict[str, str]] = {
-
-    "chrome":             {"Windows": "chrome",                  "Darwin": "Google Chrome",        "Linux": "google-chrome"},
-    "google chrome":      {"Windows": "chrome",                  "Darwin": "Google Chrome",        "Linux": "google-chrome"},
-    "firefox":            {"Windows": "firefox",                 "Darwin": "Firefox",              "Linux": "firefox"},
-    "edge":               {"Windows": "msedge",                  "Darwin": "Microsoft Edge",       "Linux": "microsoft-edge"},
-    "brave":              {"Windows": "brave",                   "Darwin": "Brave Browser",        "Linux": "brave-browser"},
-    "safari":             {"Windows": "msedge",                  "Darwin": "Safari",               "Linux": "firefox"},
-    "opera":              {"Windows": "opera",                   "Darwin": "Opera",                "Linux": "opera"},
-    "whatsapp":           {"Windows": "WhatsApp",                "Darwin": "WhatsApp",             "Linux": "whatsapp"},
-    "telegram":           {"Windows": "Telegram",                "Darwin": "Telegram",             "Linux": "telegram"},
-    "discord":            {"Windows": "Discord",                 "Darwin": "Discord",              "Linux": "discord"},
-    "slack":              {"Windows": "Slack",                   "Darwin": "Slack",                "Linux": "slack"},
-    "zoom":               {"Windows": "Zoom",                    "Darwin": "zoom.us",              "Linux": "zoom"},
-    "teams":              {"Windows": "msteams",                 "Darwin": "Microsoft Teams",      "Linux": "teams"},
-    "skype":              {"Windows": "skype",                   "Darwin": "Skype",                "Linux": "skype"},
-    "signal":             {"Windows": "signal",                  "Darwin": "Signal",               "Linux": "signal"},
-    "spotify":            {"Windows": "Spotify",                 "Darwin": "Spotify",              "Linux": "spotify"},
-    "vlc":                {"Windows": "vlc",                     "Darwin": "VLC",                  "Linux": "vlc"},
-    "netflix":            {"Windows": "Netflix",                 "Darwin": "Netflix",              "Linux": "firefox"},
-    "vscode":             {"Windows": "code",                    "Darwin": "Visual Studio Code",   "Linux": "code"},
-    "visual studio code": {"Windows": "code",                    "Darwin": "Visual Studio Code",   "Linux": "code"},
-    "code":               {"Windows": "code",                    "Darwin": "Visual Studio Code",   "Linux": "code"},
-    "terminal":           {"Windows": "wt",                      "Darwin": "Terminal",             "Linux": "x-terminal-emulator"},
-    "cmd":                {"Windows": "cmd.exe",                 "Darwin": "Terminal",             "Linux": "bash"},
-    "powershell":         {"Windows": "powershell.exe",          "Darwin": "Terminal",             "Linux": "bash"},
-    "postman":            {"Windows": "Postman",                 "Darwin": "Postman",              "Linux": "postman"},
-    "git":                {"Windows": "git-bash",                "Darwin": "Terminal",             "Linux": "bash"},
-    "figma":              {"Windows": "Figma",                   "Darwin": "Figma",                "Linux": "figma"},
-    "blender":            {"Windows": "blender",                 "Darwin": "Blender",              "Linux": "blender"},
-    "word":               {"Windows": "winword",                 "Darwin": "Microsoft Word",       "Linux": "libreoffice --writer"},
-    "excel":              {"Windows": "excel",                   "Darwin": "Microsoft Excel",      "Linux": "libreoffice --calc"},
-    "powerpoint":         {"Windows": "powerpnt",                "Darwin": "Microsoft PowerPoint", "Linux": "libreoffice --impress"},
-    "libreoffice":        {"Windows": "soffice",                 "Darwin": "LibreOffice",          "Linux": "libreoffice"},
-    "notepad":            {"Windows": "notepad.exe",             "Darwin": "TextEdit",             "Linux": "gedit"},
-    "textedit":           {"Windows": "notepad.exe",             "Darwin": "TextEdit",             "Linux": "gedit"},
-    "explorer":           {"Windows": "explorer.exe",            "Darwin": "Finder",               "Linux": "nautilus"},
-    "file explorer":      {"Windows": "explorer.exe",            "Darwin": "Finder",               "Linux": "nautilus"},
-    "finder":             {"Windows": "explorer.exe",            "Darwin": "Finder",               "Linux": "nautilus"},
-    "task manager":       {"Windows": "taskmgr.exe",             "Darwin": "Activity Monitor",     "Linux": "gnome-system-monitor"},
-    "settings":           {"Windows": "ms-settings:",            "Darwin": "System Preferences",   "Linux": "gnome-control-center"},
-    "calculator":         {"Windows": "calc.exe",                "Darwin": "Calculator",           "Linux": "gnome-calculator"},
-    "paint":              {"Windows": "mspaint.exe",             "Darwin": "Preview",              "Linux": "gimp"},
-    "instagram":          {"Windows": "Instagram",               "Darwin": "Instagram",            "Linux": "firefox"},
-    "tiktok":             {"Windows": "TikTok",                  "Darwin": "TikTok",               "Linux": "firefox"},
-    "notion":             {"Windows": "Notion",                  "Darwin": "Notion",               "Linux": "notion"},
-    "obsidian":           {"Windows": "Obsidian",                "Darwin": "Obsidian",             "Linux": "obsidian"},
-    "capcut":             {"Windows": "CapCut",                  "Darwin": "CapCut",               "Linux": "capcut"},
-    "steam":              {"Windows": "steam",                   "Darwin": "Steam",                "Linux": "steam"},
-    "epic":               {"Windows": "EpicGamesLauncher",       "Darwin": "Epic Games Launcher",  "Linux": "legendary"},
-    "epic games":         {"Windows": "EpicGamesLauncher",       "Darwin": "Epic Games Launcher",  "Linux": "legendary"},
+# ── Modern Application & Protocol Maps ───────────────────────────────────────
+_URI_PROTOCOLS: dict[str, str] = {
+    "settings": "ms-settings:",
+    "windows settings": "ms-settings:",
+    "calculator": "calculator:",
+    "calc": "calculator:",
+    "clock": "ms-clock:",
+    "alarms": "ms-clock:",
+    "camera": "microsoft.windows.camera:",
+    "store": "ms-windows-store:",
+    "photos": "ms-photos:",
+    "calendar": "outlookcal:",
+    "mail": "outlookmail:",
+    "spotify": "spotify:",
+    "whatsapp": "whatsapp:",
+    "discord": "discord:",
+    "slack": "slack:",
+    "telegram": "tg:",
+    "steam": "steam://open/main",
+    "epic": "com.epicgames.launcher:",
+    "epic games": "com.epicgames.launcher:",
 }
 
+_COMMON_EXECUTABLES: dict[str, list[str]] = {
+    "chrome": ["chrome.exe"],
+    "google chrome": ["chrome.exe"],
+    "edge": ["msedge.exe"],
+    "microsoft edge": ["msedge.exe"],
+    "firefox": ["firefox.exe"],
+    "brave": ["brave.exe"],
+    "opera": ["opera.exe"],
+    "operagx": ["opera.exe"],
+    "code": ["code.cmd", "code.exe"],
+    "vscode": ["code.cmd", "code.exe"],
+    "visual studio code": ["code.cmd", "code.exe"],
+    "notepad": ["notepad.exe"],
+    "word": ["winword.exe"],
+    "excel": ["excel.exe"],
+    "powerpoint": ["powerpnt.exe"],
+    "cmd": ["cmd.exe"],
+    "terminal": ["wt.exe", "powershell.exe", "cmd.exe"],
+    "powershell": ["powershell.exe"],
+    "task manager": ["taskmgr.exe"],
+    "explorer": ["explorer.exe"],
+    "file explorer": ["explorer.exe"],
+    "paint": ["mspaint.exe"],
+    "vlc": ["vlc.exe"],
+}
 
-def _normalize(raw: str) -> str:
-    key = raw.lower().strip()
+# ── In-Memory Cache for Installed Apps ───────────────────────────────────────
+_SHORTCUT_CACHE: dict[str, Path] = {}
+_REGISTRY_CACHE: dict[str, str] = {}
+_CACHE_INITIALIZED: bool = False
 
-    if key in _APP_ALIASES:
-        return _APP_ALIASES[key].get(_SYSTEM, raw)
 
-    for alias_key, os_map in _APP_ALIASES.items():
-        if alias_key in key or key in alias_key:
-            return os_map.get(_SYSTEM, raw)
+# ── Window Focusing Helpers ──────────────────────────────────────────────────
+def _focus_existing_window(app_query: str) -> bool:
+    """Checks if a window matching the app name is open and brings it to the front."""
+    if not user32:
+        return False
 
-    return raw  
+    target = app_query.lower().strip()
+    found_hwnds: list[int] = []
 
-def _launch_windows(app_name: str) -> bool:
+    def enum_windows_callback(hwnd, extra):
+        if user32.IsWindowVisible(hwnd):
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length > 0:
+                buff = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(hwnd, buff, length + 1)
+                title = buff.value.lower()
+                if target in title:
+                    found_hwnds.append(hwnd)
+        return True
 
-    if shutil.which(app_name) or shutil.which(app_name.split(".")[0]):
+    try:
+        EnumWindowsProc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+        user32.EnumWindows(EnumWindowsProc(enum_windows_callback), 0)
+
+        if found_hwnds:
+            hwnd = found_hwnds[0]
+            # SW_RESTORE = 9; restores window if minimized
+            user32.ShowWindow(hwnd, 9)
+            user32.SetForegroundWindow(hwnd)
+            return True
+    except Exception as e:
+        print(f"[open_app] Focus check error: {e}")
+
+    return False
+
+
+# ── Registry & Shortcut Indexers ─────────────────────────────────────────────
+def _populate_windows_cache():
+    """Builds an index of installed applications from Windows Registry and Start Menu."""
+    global _SHORTCUT_CACHE, _REGISTRY_CACHE, _CACHE_INITIALIZED
+    if _CACHE_INITIALIZED or os.name != "nt":
+        return
+
+    import winreg
+
+    # 1. Index Windows Registry App Paths (HKLM & HKCU)
+    hives = [
+        (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"),
+        (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"),
+    ]
+
+    for root_hive, subkey_path in hives:
         try:
+            with winreg.OpenKey(root_hive, subkey_path) as key:
+                num_subkeys, _, _ = winreg.QueryInfoKey(key)
+                for i in range(num_subkeys):
+                    try:
+                        app_key_name = winreg.EnumKey(key, i)
+                        with winreg.OpenKey(key, app_key_name) as app_key:
+                            exe_path, _ = winreg.QueryValueEx(app_key, "")
+                            if exe_path and os.path.exists(exe_path.strip('"')):
+                                clean_name = app_key_name.lower().replace(".exe", "")
+                                _REGISTRY_CACHE[clean_name] = exe_path.strip('"')
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+
+    # 2. Index Start Menu Shortcuts (.lnk files)
+    start_dirs = [
+        Path(os.environ.get("PROGRAMDATA", r"C:\ProgramData")) / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+        Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs",
+    ]
+
+    for base_dir in start_dirs:
+        if base_dir.exists():
+            try:
+                for lnk in base_dir.rglob("*.lnk"):
+                    name = lnk.stem.lower()
+                    if name not in _SHORTCUT_CACHE:
+                        _SHORTCUT_CACHE[name] = lnk
+            except Exception:
+                pass
+
+    _CACHE_INITIALIZED = True
+    print(f"[open_app] Indexed {len(_REGISTRY_CACHE)} registry apps and {len(_SHORTCUT_CACHE)} shortcuts.")
+
+
+def _find_best_match(query: str, candidates: list[str]) -> str | None:
+    """Finds the closest match using token overlap and similarity."""
+    q = query.lower().strip()
+    if q in candidates:
+        return q
+
+    # Substring check
+    for c in candidates:
+        if q == c or f" {q} " in f" {c} ":
+            return c
+
+    # Fuzzy match
+    matches = difflib.get_close_matches(q, candidates, n=1, cutoff=0.6)
+    return matches[0] if matches else None
+
+
+# ── Launch Strategies ────────────────────────────────────────────────────────
+def _launch_target(target: str | Path) -> bool:
+    """Executes a file, path, or URI cleanly on Windows."""
+    try:
+        if isinstance(target, Path):
+            target = str(target)
+
+        # os.startfile is non-blocking, detached, and displays no black console
+        os.startfile(target)
+        return True
+    except Exception as e:
+        print(f"[open_app] os.startfile failed for '{target}': {e}")
+        try:
+            # Fallback to detached subprocess
+            DETACHED_FLAG = 0x00000008
             subprocess.Popen(
-                app_name,
+                target,
                 shell=True,
+                creationflags=DETACHED_FLAG,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
             )
-            time.sleep(1.5)
             return True
-        except Exception as e:
-            print(f"[open_app] subprocess failed: {e}")
-
-    if ":" in app_name:
-        try:
-            subprocess.Popen(f"start {app_name}", shell=True)
-            time.sleep(1.0)
-            return True
-        except Exception:
-            pass
-
-    try:
-        import pyautogui
-        pyautogui.PAUSE = 0.1
-        pyautogui.press("win")
-        time.sleep(0.7)
-        pyautogui.write(app_name, interval=0.05)
-        time.sleep(0.9)
-        pyautogui.press("enter")
-        time.sleep(2.5)
-        return True
-    except Exception as e:
-        print(f"[open_app] Start Menu search failed: {e}")
-
-    return False
+        except Exception as e2:
+            print(f"[open_app] Subprocess launch failed: {e2}")
+            return False
 
 
-def _launch_macos(app_name: str) -> bool:
-
-    try:
-        result = subprocess.run(
-            ["open", "-a", app_name],
-            capture_output=True, timeout=8
-        )
-        if result.returncode == 0:
-            time.sleep(1.0)
-            return True
-    except Exception:
-        pass
-
-    try:
-        result = subprocess.run(
-            ["open", "-a", f"{app_name}.app"],
-            capture_output=True, timeout=8
-        )
-        if result.returncode == 0:
-            time.sleep(1.0)
-            return True
-    except Exception:
-        pass
-
-    binary = shutil.which(app_name) or shutil.which(app_name.lower())
-    if binary:
-        try:
-            subprocess.Popen(
-                [binary],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            time.sleep(1.0)
-            return True
-        except Exception:
-            pass
-
-    try:
-        import pyautogui
-        pyautogui.hotkey("command", "space")
-        time.sleep(0.6)
-        pyautogui.write(app_name, interval=0.05)
-        time.sleep(0.8)
-        pyautogui.press("enter")
-        time.sleep(1.5)
-        return True
-    except Exception as e:
-        print(f"[open_app] Spotlight failed: {e}")
-
-    return False
-
-
-_LINUX_TERMINAL_FALLBACKS = [
-    "x-terminal-emulator", "gnome-terminal", "konsole", "xfce4-terminal",
-    "xterm", "lxterminal", "mate-terminal", "tilix", "alacritty", "kitty",
-]
-
-def _launch_linux(app_name: str) -> bool:
-
-    # terminal emulators: try common ones in order
-    if app_name in ("x-terminal-emulator", "gnome-terminal", "terminal"):
-        for term in _LINUX_TERMINAL_FALLBACKS:
-            if shutil.which(term):
-                try:
-                    subprocess.Popen([term], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    time.sleep(1.0)
-                    return True
-                except Exception:
-                    continue
-
-    binary = (
-        shutil.which(app_name) or
-        shutil.which(app_name.lower()) or
-        shutil.which(app_name.lower().replace(" ", "-")) or
-        shutil.which(app_name.lower().replace(" ", "_"))
-    )
-    if binary:
-        try:
-            subprocess.Popen(
-                [binary],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            time.sleep(1.0)
-            return True
-        except Exception:
-            pass
-
-    try:
-        subprocess.run(
-            ["xdg-open", app_name],
-            capture_output=True, timeout=5
-        )
-        return True
-    except Exception:
-        pass
-
-    for desktop_name in [
-        app_name.lower(),
-        app_name.lower().replace(" ", "-"),
-        app_name.lower().replace(" ", ""),
-    ]:
-        try:
-            result = subprocess.run(
-                ["gtk-launch", desktop_name],
-                capture_output=True, timeout=5
-            )
-            if result.returncode == 0:
-                return True
-        except Exception:
-            pass
-
-    return False
-
-
-_OS_LAUNCHERS = {
-    "Windows": _launch_windows,
-    "Darwin":  _launch_macos,
-    "Linux":   _launch_linux,
-}
-
+# ── Main Entry Point ─────────────────────────────────────────────────────────
 def open_app(
     parameters=None,
     response=None,
     player=None,
     session_memory=None,
 ) -> str:
-    app_name = (parameters or {}).get("app_name", "").strip()
+    """
+    Finds and opens any application on the operating system.
+    Matches parameters defined in main.py: open_app(app_name)
+    """
+    raw_name = (parameters or {}).get("app_name", "").strip()
 
-    if not app_name:
-        return "No application name provided."
+    if not raw_name:
+        return "Please specify the name of the application you want to open, sir."
 
-    launcher = _OS_LAUNCHERS.get(_SYSTEM)
-    if launcher is None:
-        return f"Unsupported operating system: {_SYSTEM}"
+    clean_name = raw_name.lower().strip()
 
-    normalized = _normalize(app_name)
-    print(f"[open_app] Launching: '{app_name}' → '{normalized}' ({_SYSTEM})")
+    if player and hasattr(player, "write_log"):
+        player.write_log(f"SYS: 🚀 Launching application: '{raw_name}'...")
 
-    if player:
-        player.write_log(f"[open_app] {app_name}")
+    # Non-Windows Fallback
+    if os.name != "nt":
+        binary = shutil.which(clean_name)
+        if binary:
+            subprocess.Popen([binary])
+            return f"Opened {raw_name}."
+        return f"Unable to launch {raw_name} on this operating system."
 
-    try:
-        if launcher(normalized):
-            return f"Opened {app_name}."
-        if normalized.lower() != app_name.lower():
-            if launcher(app_name):
-                return f"Opened {app_name}."
-        return (
-            f"Could not confirm that {app_name} launched. "
-            f"It may still be loading, or it might not be installed."
-        )
-    except Exception as e:
-        print(f"[open_app] Error: {e}")
-        return f"Failed to open {app_name}: {e}"
+    # Ensure search cache is ready
+    _populate_windows_cache()
+
+    # ── Strategy 1: Check if already open and focus it ────────────────────────
+    # Exclude system utilities that users often open multiple windows of
+    multi_window_exceptions = {"notepad", "calculator", "terminal", "cmd", "explorer"}
+    if clean_name not in multi_window_exceptions:
+        if _focus_existing_window(clean_name):
+            msg = f"Switched to already running {raw_name}."
+            if player and hasattr(player, "write_log"):
+                player.write_log(f"SYS: 🪟 {msg}")
+            return msg
+
+    # ── Strategy 2: Modern UWP & URI Protocols ────────────────────────────────
+    proto_match = _find_best_match(clean_name, list(_URI_PROTOCOLS.keys()))
+    if proto_match:
+        uri = _URI_PROTOCOLS[proto_match]
+        if _launch_target(uri):
+            return f"Opened {raw_name}."
+
+    # ── Strategy 3: Common Executable Aliases ─────────────────────────────────
+    alias_match = _find_best_match(clean_name, list(_COMMON_EXECUTABLES.keys()))
+    if alias_match:
+        for exe in _COMMON_EXECUTABLES[alias_match]:
+            found_path = shutil.which(exe) or _REGISTRY_CACHE.get(exe.replace(".exe", ""))
+            if found_path and _launch_target(found_path):
+                return f"Opened {raw_name}."
+
+    # ── Strategy 4: Windows Registry App Paths Index ─────────────────────────
+    reg_match = _find_best_match(clean_name, list(_REGISTRY_CACHE.keys()))
+    if reg_match:
+        exe_path = _REGISTRY_CACHE[reg_match]
+        if _launch_target(exe_path):
+            return f"Opened {raw_name}."
+
+    # ── Strategy 5: Start Menu Shortcuts Index (.lnk) ────────────────────────
+    lnk_match = _find_best_match(clean_name, list(_SHORTCUT_CACHE.keys()))
+    if lnk_match:
+        lnk_path = _SHORTCUT_CACHE[lnk_match]
+        if _launch_target(lnk_path):
+            return f"Opened {raw_name}."
+
+    # ── Strategy 6: System PATH Fallback ──────────────────────────────────────
+    direct_which = shutil.which(clean_name) or shutil.which(f"{clean_name}.exe")
+    if direct_which and _launch_target(direct_which):
+        return f"Opened {raw_name}."
+
+    # ── Strategy 7: Native Windows Shell Execution ────────────────────────────
+    # Handles direct shell commands like "explorer.exe", "control", "calc"
+    if _launch_target(raw_name):
+        return f"Executed {raw_name}."
+
+    return (
+        f"I could not locate '{raw_name}' on your system, sir. "
+        "Please ensure the application is installed or verify the name."
+    )

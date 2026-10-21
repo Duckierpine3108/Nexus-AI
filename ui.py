@@ -23,6 +23,7 @@ import threading
 import time
 import struct
 import random
+import traceback
 from datetime import datetime
 from pathlib import Path
 
@@ -1407,54 +1408,163 @@ class SetupOverlay(QWidget):
 
 class RemoteKeyOverlay(QWidget):
     closed = pyqtSignal()
-    _OW, _OH = 380, 470
+    _OW, _OH = 400, 540
 
     def __init__(self, url: str, key: str, auto_login_url: str = "", manual_url: str = "", expiry_secs: int = 600, parent=None):
         super().__init__(parent)
         self.setAttribute(Qt.WidgetAttribute.WA_StyledBackground, True)
-        self.setStyleSheet(f"RemoteKeyOverlay {{ background: {Theme.PANEL}; border: 1px solid {Theme.BORDER_H}; border-radius: 14px; }}")
+        self.setStyleSheet("""
+            RemoteKeyOverlay {
+                background: rgba(8, 14, 26, 0.97);
+                border: 1.5px solid rgba(0, 242, 254, 0.45);
+                border-radius: 16px;
+            }
+        """)
         self._expiry = time.time() + expiry_secs
         self._on_new_key = None
         self._manual_url = manual_url or url
         self._auto_login_url = auto_login_url
+        self._url = url
 
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(20, 16, 20, 16); lay.setSpacing(6)
-        t = QLabel("📱  Mobile Remote Access")
-        t.setFont(QFont("Segoe UI", 11, QFont.Weight.Bold))
-        t.setStyleSheet(f"color: {Theme.TEXT};")
-        t.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lay.addWidget(t)
+        lay.setContentsMargins(22, 16, 22, 16)
+        lay.setSpacing(7)
+
+        # ── Header Bar ────────────────────────────────────────────────────────
+        hdr = QHBoxLayout()
+        t = QLabel("📱  REMOTE ACCESS TERMINAL")
+        t.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        t.setStyleSheet("color: #00F2FE; letter-spacing: 1.2px; background: transparent; border: none;")
+        hdr.addWidget(t)
+        hdr.addStretch()
+
+        close_x = QPushButton("✕")
+        close_x.setFixedSize(22, 22)
+        close_x.setCursor(Qt.CursorShape.PointingHandCursor)
+        close_x.setStyleSheet("""
+            QPushButton {
+                color: #94A3B8;
+                background: transparent;
+                border: none;
+                font-size: 13px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                color: #EF4444;
+            }
+        """)
+        close_x.clicked.connect(self._do_close)
+        hdr.addWidget(close_x)
+        lay.addLayout(hdr)
+
+        sub_t = QLabel("Scan QR code from your phone or visit the URL below:")
+        sub_t.setFont(QFont("Segoe UI", 7))
+        sub_t.setStyleSheet("color: #94A3B8; background: transparent; border: none;")
+        sub_t.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(sub_t)
+
+        lay.addSpacing(2)
+
+        # ── QR Code Card (With Generous Quiet Zone & Square Safe-Area) ────────
+        qr_frame = QFrame()
+        qr_frame.setFixedSize(206, 206)
+        qr_frame.setStyleSheet("""
+            QFrame {
+                background: #FFFFFF;
+                border: 2px solid rgba(0, 242, 254, 0.60);
+                border-radius: 10px;
+                padding: 10px;
+            }
+        """)
+        qr_inner_lay = QVBoxLayout(qr_frame)
+        qr_inner_lay.setContentsMargins(0, 0, 0, 0)
 
         self._qr_lbl = QLabel()
         self._qr_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self._qr_lbl.setFixedSize(160, 160)
-        self._qr_lbl.setStyleSheet("background: white; border-radius: 8px; padding: 4px;")
+        self._qr_lbl.setStyleSheet("background: #FFFFFF; border: none;")
         self._load_qr(auto_login_url or url)
-        qr_box = QHBoxLayout(); qr_box.addStretch(); qr_box.addWidget(self._qr_lbl); qr_box.addStretch(); lay.addLayout(qr_box)
+        qr_inner_lay.addWidget(self._qr_lbl)
+
+        qr_box = QHBoxLayout()
+        qr_box.addStretch()
+        qr_box.addWidget(qr_frame)
+        qr_box.addStretch()
+        lay.addLayout(qr_box)
+
+        # ── Direct URL Link Label ─────────────────────────────────────────────
+        self._url_lbl = QLabel(f"🌐 {self._manual_url}")
+        self._url_lbl.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+        self._url_lbl.setStyleSheet("color: #38BDF8; background: transparent; border: none;")
+        self._url_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(self._url_lbl)
+
+        # ── 6-Digit PIN Box ───────────────────────────────────────────────────
+        pin_title = QLabel("ONE-TIME ACCESS KEY")
+        pin_title.setFont(QFont("Segoe UI", 6, QFont.Weight.Bold))
+        pin_title.setStyleSheet("color: #94A3B8; letter-spacing: 1px; background: transparent; border: none;")
+        pin_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lay.addWidget(pin_title)
 
         self._key_lbl = QLabel(key)
-        self._key_lbl.setFont(QFont("Consolas", 20, QFont.Weight.Bold))
-        self._key_lbl.setStyleSheet(f"color: {Theme.G_YELLOW}; background: {Theme.PANEL_ALT}; border: 1px solid {Theme.BORDER}; border-radius: 6px; padding: 6px; letter-spacing: 6px;")
+        self._key_lbl.setFont(QFont("Consolas", 18, QFont.Weight.Bold))
+        self._key_lbl.setStyleSheet("""
+            color: #00F2FE;
+            background: rgba(0, 242, 254, 0.08);
+            border: 1px solid rgba(0, 242, 254, 0.35);
+            border-radius: 8px;
+            padding: 5px;
+            letter-spacing: 6px;
+        """)
         self._key_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(self._key_lbl)
 
+        # ── Countdown Timer ───────────────────────────────────────────────────
         self._timer_lbl = QLabel()
-        self._timer_lbl.setFont(QFont("Segoe UI", 8))
-        self._timer_lbl.setStyleSheet(f"color: {Theme.TEXT_MUTED};")
+        self._timer_lbl.setFont(QFont("Segoe UI", 7))
+        self._timer_lbl.setStyleSheet("color: #94A3B8; background: transparent; border: none;")
         self._timer_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay.addWidget(self._timer_lbl)
 
+        # ── Action Buttons ────────────────────────────────────────────────────
         btn_row = QHBoxLayout()
-        new_btn = QPushButton("New Key")
+        btn_row.setSpacing(8)
+
+        new_btn = QPushButton("🔄 Generate New Key")
         new_btn.setFixedHeight(30)
-        new_btn.setStyleSheet(f"background: {Theme.PANEL_ALT}; color: {Theme.G_BLUE}; border: 1px solid {Theme.BORDER}; border-radius: 4px;")
+        new_btn.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+        new_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        new_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(0, 242, 254, 0.14);
+                color: #00F2FE;
+                border: 1px solid rgba(0, 242, 254, 0.40);
+                border-radius: 8px;
+            }
+            QPushButton:hover {
+                background: rgba(0, 242, 254, 0.28);
+                border-color: #00F2FE;
+                color: #FFFFFF;
+            }
+        """)
         new_btn.clicked.connect(self._refresh_key)
         btn_row.addWidget(new_btn)
 
         cb = QPushButton("Dismiss")
         cb.setFixedHeight(30)
-        cb.setStyleSheet(f"background: {Theme.PANEL_ALT}; color: {Theme.TEXT_MUTED}; border: 1px solid {Theme.BORDER}; border-radius: 4px;")
+        cb.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+        cb.setCursor(Qt.CursorShape.PointingHandCursor)
+        cb.setStyleSheet("""
+            QPushButton {
+                background: rgba(255, 255, 255, 0.05);
+                color: #94A3B8;
+                border: 1px solid rgba(255, 255, 255, 0.16);
+                border-radius: 8px;
+            }
+            QPushButton:hover {
+                background: rgba(255, 255, 255, 0.12);
+                color: #F8FAFC;
+            }
+        """)
         cb.clicked.connect(self._do_close)
         btn_row.addWidget(cb)
         lay.addLayout(btn_row)
@@ -1480,7 +1590,9 @@ class RemoteKeyOverlay(QWidget):
             if res:
                 url, key = res[0], res[1]
                 auto = res[2] if len(res) >= 3 else ""
+                manual = res[3] if len(res) >= 4 else url
                 self._key_lbl.setText(key)
+                self._url_lbl.setText(f"🌐 {manual}")
                 self._load_qr(auto or url)
                 self._expiry = time.time() + 600
                 self._tick()
@@ -1488,16 +1600,42 @@ class RemoteKeyOverlay(QWidget):
     def _load_qr(self, url: str):
         try:
             import qrcode, io
-            qr = qrcode.QRCode(box_size=4, border=1); qr.add_data(url); qr.make(fit=True)
-            img = qr.make_image(fill_color="black", back_color="white"); buf = io.BytesIO(); img.save(buf, format="PNG")
-            px = QPixmap(); px.loadFromData(buf.getvalue()); self._qr_lbl.setPixmap(px.scaled(150, 150, Qt.AspectRatioMode.KeepAspectRatio))
-        except Exception: self._qr_lbl.setText(url[:20])
+            # border=4 provides the mandatory ISO quiet zone around the matrix
+            qr = qrcode.QRCode(box_size=6, border=4)
+            qr.add_data(url)
+            qr.make(fit=True)
+            img = qr.make_image(fill_color="black", back_color="white")
+            buf = io.BytesIO()
+            img.save(buf, format="PNG")
+            px = QPixmap()
+            px.loadFromData(buf.getvalue())
+            
+            # FastTransformation prevents fuzzy edges, keeping squares pixel-sharp
+            self._qr_lbl.setPixmap(
+                px.scaled(186, 186, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.FastTransformation)
+            )
+        except Exception:
+            self._qr_lbl.setText(url[:20])
 
     def mark_connected(self):
         self._ctimer.stop()
+        self.setStyleSheet("""
+            RemoteKeyOverlay {
+                background: rgba(8, 14, 26, 0.97);
+                border: 1.5px solid #10B981;
+                border-radius: 16px;
+            }
+        """)
         self._key_lbl.setText("CONNECTED")
-        self._key_lbl.setStyleSheet(f"color: {Theme.G_GREEN}; background: {Theme.PANEL_ALT}; border-radius: 6px; letter-spacing: 2px;")
-        self._timer_lbl.setText("Device active and paired")
+        self._key_lbl.setStyleSheet("""
+            color: #10B981;
+            background: rgba(16, 185, 129, 0.12);
+            border: 1px solid #10B981;
+            border-radius: 8px;
+            letter-spacing: 4px;
+        """)
+        self._timer_lbl.setText("● Device paired and actively linked")
+        self._timer_lbl.setStyleSheet("color: #10B981; font-weight: bold;")
 
     def _do_close(self):
         self._ctimer.stop()
@@ -2077,12 +2215,152 @@ class NewsBriefingPanel(QWidget):
         lay.addWidget(self._news_text)
         self.hide()
 
+    # ── ADAPTIVE RENDERER: DEEPSEEK THINKING TREES + NEWS + CONTENT ──────────
     def display_news(self, title: str, content: str):
-        if title:
-            self._title_lbl.setText(f"📰  {title.upper()}")
-        self._news_text.setHtml(f"<div style='color:#F8FAFC;'>{content}</div>")
-        self.show()
-        self.raise_()
+        raw_title = (title or "INTELLIGENCE BRIEFING").strip()
+        self._raw_news_text = content
+
+        is_thinking = any(k in raw_title.upper() for k in ("THINKING", "BLUEPRINT", "DEV", "REASONING", "ARCHITECT", "CODE"))
+
+        # 1. Dynamic Header Badge
+        if is_thinking:
+            self._title_lbl.setText(f"🧠  {raw_title.upper()}")
+            self._title_lbl.setStyleSheet("color: #00F2FE; letter-spacing: 1.2px; background: transparent; border: none;")
+        else:
+            self._title_lbl.setText(f"📰  {raw_title.upper()}")
+            self._title_lbl.setStyleSheet("color: #FBBF24; letter-spacing: 1.2px; background: transparent; border: none;")
+
+        # ── MODE A: DEEPSEEK / AI STUDIO HIERARCHICAL THINKING TREE ──────────
+        if is_thinking:
+            lines = content.splitlines()
+            html_parts = []
+            html_parts.append("""
+            <div style="font-family: 'Segoe UI', -apple-system, sans-serif; padding: 6px;">
+            """)
+
+            for line in lines:
+                l_str = line.strip()
+                if not l_str:
+                    html_parts.append("<div style='height: 8px;'></div>")
+                    continue
+
+                # Section Headers / Reasoning Root
+                if "REASONING" in l_str or "ARCHITECTURE" in l_str or "THINKING" in l_str:
+                    html_parts.append(f"""
+                    <div style="margin-bottom: 12px; margin-top: 4px;">
+                        <span style="
+                            background: rgba(0, 242, 254, 0.15);
+                            border: 1.5px solid #00F2FE;
+                            border-radius: 12px;
+                            padding: 3px 12px;
+                            color: #00F2FE;
+                            font-size: 11px;
+                            font-weight: bold;
+                            letter-spacing: 1px;
+                        ">● {l_str}</span>
+                    </div>
+                    """)
+
+                # Milestone / Phase Badges
+                elif l_str.startswith("▶") or "Phase" in l_str:
+                    html_parts.append(f"""
+                    <div style="margin-top: 10px; margin-bottom: 6px;">
+                        <span style="
+                            background: rgba(251, 188, 5, 0.15);
+                            border: 1px solid #FBBC05;
+                            border-radius: 8px;
+                            padding: 2px 10px;
+                            color: #FDE047;
+                            font-size: 10px;
+                            font-weight: bold;
+                        ">{l_str}</span>
+                    </div>
+                    """)
+
+                # Hierarchical Bullet Nodes (DeepSeek style tree nodes)
+                elif l_str.startswith("•") or l_str.startswith("-"):
+                    cleaned_bullet = l_str.lstrip("•-").strip()
+                    # Highlight module identifiers and keys
+                    if ":" in cleaned_bullet:
+                        k, v = cleaned_bullet.split(":", 1)
+                        formatted_bullet = f"<b style='color: #00F2FE;'>{k}:</b><span style='color: #F8FAFC;'>{v}</span>"
+                    else:
+                        formatted_bullet = f"<span style='color: #F8FAFC;'>{cleaned_bullet}</span>"
+
+                    html_parts.append(f"""
+                    <div style="margin-left: 12px; margin-bottom: 6px; font-size: 12px; line-height: 1.5;">
+                        <span style="color: #00F2FE; font-weight: bold; margin-right: 6px;">◆</span>
+                        {formatted_bullet}
+                    </div>
+                    """)
+
+                # Indented Child Details (Exports, functions, descriptions)
+                elif line.startswith("  ") or line.startswith("\t"):
+                    html_parts.append(f"""
+                    <div style="margin-left: 32px; margin-bottom: 4px; font-size: 11px; color: #94A3B8; font-family: 'Consolas', monospace; line-height: 1.4;">
+                        <span style="color: rgba(255,255,255,0.3); margin-right: 4px;">↳</span>
+                        {l_str}
+                    </div>
+                    """)
+
+                # Standard Text
+                else:
+                    html_parts.append(f"""
+                    <div style="margin-bottom: 6px; font-size: 12px; color: #E2E8F0; line-height: 1.5;">
+                        {l_str}
+                    </div>
+                    """)
+
+            html_parts.append("</div>")
+            self._news_box.setHtml("".join(html_parts))
+            return
+
+        # ── MODE B: STANDARD NEWS BRIEFING (PRESERVES HEADLINES) ──────────────
+        story_blocks = [b.strip() for b in content.split("---") if b.strip()]
+        if not story_blocks:
+            story_blocks = [content]
+
+        cards_html = ""
+        for i, block in enumerate(story_blocks):
+            lines = [l.strip() for l in block.split("\n") if l.strip()]
+            headline, source, detail = "", "Global Wire", ""
+
+            for line in lines:
+                if line.startswith("HEADLINE:"):
+                    parts = line.replace("HEADLINE:", "").split("| SOURCE:")
+                    headline = parts[0].strip()
+                    if len(parts) > 1:
+                        source = parts[1].strip()
+                elif line.startswith("DETAIL:"):
+                    detail = line.replace("DETAIL:", "").strip()
+                elif not headline:
+                    headline = line
+                else:
+                    detail += (" " + line)
+
+            cards_html += f"""
+            <div style="margin-bottom: 18px; padding-left: 2px;">
+                <div style="margin-bottom: 5px;">
+                    <span style="
+                        background: rgba(255, 255, 255, 0.06);
+                        border: 1px solid rgba(251, 188, 5, 0.40);
+                        border-radius: 12px;
+                        padding: 2px 10px;
+                        color: #FBBC05;
+                        font-size: 10px;
+                        font-weight: bold;
+                        letter-spacing: 0.8px;
+                    ">● STORY #{i+1}</span>
+                    <span style="color: #FDE047; font-size: 10px; font-weight: bold; margin-left: 6px;">[{source}]</span>
+                </div>
+                <div style="color: #FFFFFF; font-size: 13px; font-weight: bold; line-height: 1.4; margin-top: 4px; margin-bottom: 4px;">
+                    {headline}
+                </div>
+                {f'<div style="color: #CBD5E1; font-size: 11px; line-height: 1.45;">{detail}</div>' if detail else ''}
+            </div>
+            """
+
+        self._news_box.setHtml(cards_html)
 
 
 # ── 3. Full Conversation History Dialog (With Select & Copy) ──────────────────
@@ -2254,8 +2532,10 @@ class LeftSidebarDock(QWidget):
     eye_toggled = pyqtSignal()
     head_toggled = pyqtSignal()
     matrix_toggled = pyqtSignal()
+    remote_clicked = pyqtSignal()
+    devices_clicked = pyqtSignal()  # 🛰️ Device Tracker signal
     stop_clicked = pyqtSignal()
-
+    
     def __init__(self, assistant_name: str = "NEXUS", parent=None):
         super().__init__(parent)
         self.setFixedWidth(200)
@@ -2398,6 +2678,52 @@ class LeftSidebarDock(QWidget):
         self.btn_matrix.clicked.connect(self.matrix_toggled.emit)
         layout.addWidget(self.btn_matrix)
 
+        # Remote Control QR Button (Nexus Style)
+        self.btn_remote = QPushButton("📱 Remote Control")
+        self.btn_remote.setFixedHeight(30)
+        self.btn_remote.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+        self.btn_remote.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_remote.setStyleSheet("""
+            QPushButton {
+                background: rgba(255, 255, 255, 0.04);
+                color: #F8FAFC;
+                border: 1px solid rgba(255, 255, 255, 0.22);
+                border-radius: 8px;
+                text-align: left;
+                padding-left: 10px;
+            }
+            QPushButton:hover {
+                background: rgba(0, 242, 254, 0.15);
+                border-color: rgba(0, 242, 254, 0.55);
+                color: #00F2FE;
+            }
+        """)
+        self.btn_remote.clicked.connect(self.remote_clicked.emit)
+        layout.addWidget(self.btn_remote)
+
+        # 🛰️ Device Tracker Button (Positioned right above Stop)
+        self.btn_devices = QPushButton("🛰️ Device Tracker")
+        self.btn_devices.setFixedHeight(30)
+        self.btn_devices.setFont(QFont("Segoe UI", 7, QFont.Weight.Bold))
+        self.btn_devices.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.btn_devices.setStyleSheet("""
+            QPushButton {
+                background: rgba(255, 255, 255, 0.04);
+                color: #F8FAFC;
+                border: 1px solid rgba(255, 255, 255, 0.22);
+                border-radius: 8px;
+                text-align: left;
+                padding-left: 10px;
+            }
+            QPushButton:hover {
+                background: rgba(0, 242, 254, 0.18);
+                border-color: rgba(0, 242, 254, 0.65);
+                color: #00F2FE;
+            }
+        """)
+        self.btn_devices.clicked.connect(self.devices_clicked.emit)
+        layout.addWidget(self.btn_devices)
+
         # Stop Button
         self.btn_stop = QPushButton("⏹ Stop [ESC]")
         self.btn_stop.setFixedHeight(30)
@@ -2513,6 +2839,37 @@ class LeftSidebarDock(QWidget):
                 QPushButton:hover {
                     background: rgba(255, 255, 255, 0.10);
                     border-color: rgba(255, 255, 255, 0.45);
+                }
+            """)
+            
+    def set_devices_state(self, active: bool):
+        if active:
+            self.btn_devices.setText("🛰️ Tracker: LIVE")
+            self.btn_devices.setStyleSheet("""
+                QPushButton {
+                    background: rgba(0, 242, 254, 0.20);
+                    color: #00F2FE;
+                    border: 1.5px solid #00F2FE;
+                    border-radius: 8px;
+                    text-align: left;
+                    padding-left: 10px;
+                }
+            """)
+        else:
+            self.btn_devices.setText("🛰️ Device Tracker")
+            self.btn_devices.setStyleSheet("""
+                QPushButton {
+                    background: rgba(255, 255, 255, 0.04);
+                    color: #F8FAFC;
+                    border: 1px solid rgba(255, 255, 255, 0.22);
+                    border-radius: 8px;
+                    text-align: left;
+                    padding-left: 10px;
+                }
+                QPushButton:hover {
+                    background: rgba(0, 242, 254, 0.18);
+                    border-color: rgba(0, 242, 254, 0.65);
+                    color: #00F2FE;
                 }
             """)
 
@@ -3796,7 +4153,7 @@ class FullChatView(QWidget):
             QApplication.clipboard().setText(plain)
 
 
-# ── FULL-WINDOW VIEW 2: 4K GOLDEN SOLAR SILK RIVER NEWS PANEL ────────────────
+# ── FULL-WINDOW VIEW 2: MULTI-MODE INTELLIGENCE HUD & CONTENT VIEWER ─────────
 class FullNewsView(QWidget):
     back_requested = pyqtSignal()
 
@@ -3806,16 +4163,14 @@ class FullNewsView(QWidget):
 
         # ── 1. 4K VOLUMETRIC SOLAR SILK RIVER INITIALIZATION ─────────────────
         self._phase = 0.0
-        self._strands = 24            # High-density ribbon strands
-        self._points_per_strand = 56  # 56 points per strand (1,344 active wave particles)
+        self._strands = 24
+        self._points_per_strand = 56
 
-        # Harmonic organic seed offsets
         self._jitters = [
             [(random.uniform(-3.5, 3.5), random.uniform(-3.5, 3.5)) for _ in range(self._points_per_strand)]
             for _ in range(self._strands)
         ]
 
-        # Drifting Solar Photon Dust
         self._solardust = [
             {
                 "x_norm": random.uniform(0.01, 0.99),
@@ -3830,85 +4185,70 @@ class FullNewsView(QWidget):
             for _ in range(140)
         ]
 
-        # High-Fidelity Timer (~35 FPS)
         self._anim_timer = QTimer(self)
         self._anim_timer.timeout.connect(self._step_solar_silk)
         self._anim_timer.start(28)
 
-        # Root Outer Layout
+        # Root Layout
         root_lay = QVBoxLayout(self)
         root_lay.setContentsMargins(28, 24, 28, 24)
         root_lay.setSpacing(14)
 
-        # ── 2. TOP GOLD CYBER HEADER BAR ─────────────────────────────────────
+        # ── 2. DYNAMIC TOP CYBER HEADER BAR ──────────────────────────────────
         hdr = QHBoxLayout()
         hdr.setSpacing(12)
 
-        # Glowing Neon Gold Back Button
         self.back_btn = QPushButton("← BACK TO CORE")
         self.back_btn.setFixedHeight(32)
         self.back_btn.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         self.back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.back_btn.setStyleSheet("""
             QPushButton {
-                background: rgba(251, 188, 5, 0.16);
-                color: #FDE047;
-                border: 1.5px solid #FBBC05;
+                background: rgba(0, 242, 254, 0.16);
+                color: #E0F2FE;
+                border: 1.5px solid #00F2FE;
                 border-radius: 16px;
                 padding: 0 16px;
                 letter-spacing: 0.8px;
             }
             QPushButton:hover {
-                background: rgba(251, 188, 5, 0.38);
+                background: rgba(0, 242, 254, 0.38);
                 color: #FFFFFF;
-                border-color: #F59E0B;
-            }
-            QPushButton:pressed {
-                background: rgba(251, 188, 5, 0.55);
+                border-color: #38BDF8;
             }
         """)
         self.back_btn.clicked.connect(self.back_requested.emit)
         hdr.addWidget(self.back_btn)
 
-        # Title with News Satellite Icon
-        self._title_lbl = QLabel("📰  NEWS — TOP WORLD NEWS TODAY")
+        self._title_lbl = QLabel("📰  INTELLIGENCE STREAM")
         self._title_lbl.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
-        self._title_lbl.setStyleSheet("""
-            color: #FBBF24;
-            letter-spacing: 1.2px;
-            background: transparent;
-            border: none;
-        """)
+        self._title_lbl.setStyleSheet("color: #00F2FE; letter-spacing: 1.2px; background: transparent; border: none;")
         hdr.addWidget(self._title_lbl)
 
         hdr.addStretch()
 
-        # Glowing Gold "Copy Briefing" Button
-        self.copy_btn = QPushButton("📋 Copy Briefing")
+        self.copy_btn = QPushButton("📋 Copy Content")
         self.copy_btn.setFixedHeight(32)
         self.copy_btn.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
         self.copy_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.copy_btn.setStyleSheet("""
             QPushButton {
-                background: rgba(251, 188, 5, 0.16);
-                color: #FEF08A;
-                border: 1.5px solid #FBBC05;
+                background: rgba(255, 255, 255, 0.08);
+                color: #F8FAFC;
+                border: 1.5px solid rgba(255, 255, 255, 0.28);
                 border-radius: 16px;
                 padding: 0 16px;
             }
             QPushButton:hover {
-                background: rgba(251, 188, 5, 0.38);
+                background: rgba(255, 255, 255, 0.20);
                 color: #FFFFFF;
-            }
-            QPushButton:pressed {
-                background: rgba(251, 188, 5, 0.55);
             }
         """)
         self.copy_btn.clicked.connect(self._copy_all_news)
         hdr.addWidget(self.copy_btn)
         root_lay.addLayout(hdr)
 
-        # ── 3. 100% TRANSPARENT NEWS VIEWER ──────────────────────────────────
+        # ── 3. TRANSPARENT CONTENT VIEWER ────────────────────────────────────
         self._news_box = QTextEdit()
         self._news_box.setReadOnly(True)
         self._news_box.setFont(QFont("Segoe UI", 9))
@@ -3926,7 +4266,7 @@ class FullNewsView(QWidget):
                 margin: 0px;
             }
             QScrollBar::handle:vertical {
-                background: #FBBC05;
+                background: rgba(0, 242, 254, 0.6);
                 border-radius: 3px;
                 min-height: 25px;
             }
@@ -3949,19 +4289,14 @@ class FullNewsView(QWidget):
                 d["x_norm"] = random.uniform(0.01, 0.99)
         self.update()
 
-    # ── PAINTER: DRAWS 4K HIGH-DENSITY GOLDEN SILK RIVER ─────────────────────
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
         w, h = float(self.width()), float(self.height())
 
-        # Base Obsidian-Amber Void
         p.fillRect(self.rect(), qcol("#070501"))
-
         p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Plus)
 
-        # Ambient Solar Flare Bloom
         bloom_x = w * 0.65 + math.sin(self._phase * 0.4) * 55.0
         bloom_y = h * 0.72 + math.cos(self._phase * 0.5) * 35.0
         bloom = QRadialGradient(bloom_x, bloom_y, w * 0.55)
@@ -3972,76 +4307,188 @@ class FullNewsView(QWidget):
         p.setPen(Qt.PenStyle.NoPen)
         p.drawRect(self.rect())
 
-        # ── 4K UNDULATING TOPOGRAPHIC SOLAR SILK RIVER ───────────────────────
         for s in range(self._strands):
-            v = (s / float(self._strands - 1)) - 0.5  # Strand depth ratio
-
+            v = (s / float(self._strands - 1)) - 0.5
             for i in range(self._points_per_strand):
                 u = i / float(self._points_per_strand - 1)
                 jit_x, jit_y = self._jitters[s][i]
-
-                # Sweeping S-Curve river flowing diagonally across the canvas
                 base_y = h * (0.84 - 0.46 * u + 0.14 * math.sin(u * math.pi * 1.6))
                 base_x = w * (u * 1.06 - 0.03)
-
-                # Multi-frequency volumetric silk folds
                 fold1 = math.sin(u * 4.2 - self._phase * 1.1 + v * 3.6) * 58.0
                 fold2 = math.cos(u * 7.8 + self._phase * 1.3) * 24.0
                 fan_offset_y = v * (140.0 + 45.0 * math.sin(u * 3.2 + self._phase * 0.8))
-
                 px = base_x + (math.cos(u * 2.8 - self._phase * 0.7 + v * 1.8) * 32.0) + jit_x
                 py = base_y + fold1 + fold2 + fan_offset_y + jit_y
-
-                # Depth projection (0.0 to 1.0)
                 depth = (math.sin(u * 4.4 - self._phase + v * 3.8) * 0.5 + 0.5)
-
                 p_size = 1.1 + (depth * 2.6)
                 alpha = int(40 + depth * 210)
-
-                # Specular coloring
-                if depth > 0.82:
-                    col = qcol("#FFFFFF" if depth > 0.92 else "#FEF08A", alpha)
-                elif depth > 0.45:
-                    col = qcol("#FBBC05", alpha)
-                else:
-                    col = qcol("#B45309", int(alpha * 0.80))
-
+                col = qcol("#FFFFFF" if depth > 0.82 else ("#FBBC05" if depth > 0.45 else "#B45309"), alpha)
                 p.setBrush(QBrush(col))
                 p.drawEllipse(QPointF(px, py), p_size, p_size)
 
-        # ── FLOATING SOLAR DUST EMBERS ───────────────────────────────────────
         for d in self._solardust:
             sx = d["x_norm"] * w
             sy = d["y_norm"] * h
             twinkle = (math.sin(d["twinkle_phase"]) * 0.5 + 0.5)
             s_alpha = int(d["base_alpha"] * (0.4 + 0.6 * twinkle))
-
-            col = qcol("#FFFFFF" if twinkle > 0.85 else "#FDE047", s_alpha)
-            p.setBrush(QBrush(col))
+            p.setBrush(QBrush(qcol("#FFFFFF" if twinkle > 0.85 else "#FDE047", s_alpha)))
             p.drawEllipse(QPointF(sx, sy), d["size"], d["size"])
 
-        # ── RESTORE STANDARD COMPOSITION FOR AMBER CYBER FRAME ───────────────
         p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
-
         inner_rect = QRectF(14, 14, w - 28, h - 28)
-
-        # Double Neon Amber Bezel
         p.setBrush(Qt.BrushStyle.NoBrush)
         p.setPen(QPen(qcol("#FBBC05", 48), 7.0))
         p.drawRoundedRect(inner_rect, 14, 14)
-
         p.setPen(QPen(qcol("#FBBC05", 240), 1.8))
         p.drawRoundedRect(inner_rect, 14, 14)
 
-        inset_rect = QRectF(18, 18, w - 36, h - 36)
-        p.setPen(QPen(qcol("#FDE047", 75), 1.0))
-        p.drawRoundedRect(inset_rect, 11, 11)
-
-    # ── PURE TRANSPARENT TEXT WITH FROSTED GLASS STORY CHIPS ─────────────────
+    # ── ADAPTIVE MULTI-FORMAT RENDERER ───────────────────────────────────────
     def display_news(self, title: str, content: str):
-        if title:
-            self._title_lbl.setText(f"📰  {title.upper()}")
+        raw_title = (title or "INTELLIGENCE STREAM").strip()
         self._raw_news_text = content
+        upper_title = raw_title.upper()
+
+        is_diff = any(k in upper_title for k in ("DIFF", "PATCH", "CODE", "EVOLUTION", "AUDIT", "WRITE")) or content.startswith(("--- a/", "@@", "diff --git"))
+        is_thinking = any(k in upper_title for k in ("THINK", "REASON", "DIAGNOS", "PLAN", "BLUEPRINT", "DEV", "RESEARCH"))
+        is_search = "SEARCH" in upper_title or "PRICE" in upper_title or "COMPARE" in upper_title or "Web search results for:" in content or "Direct Answer:" in content
+
+        # ── MODE 1: SURGICAL CODE DIFF VIEWER ────────────────────────────────
+        if is_diff:
+            self._title_lbl.setText(f"🛠️  {upper_title}")
+            self._title_lbl.setStyleSheet("color: #00F2FE; letter-spacing: 1.2px; background: transparent; border: none;")
+            self.copy_btn.setText("📋 Copy Diff")
+            self.copy_btn.setStyleSheet("""
+                QPushButton {
+                    background: rgba(0, 242, 254, 0.15);
+                    color: #00F2FE;
+                    border: 1.5px solid #00F2FE;
+                    border-radius: 16px;
+                    padding: 0 16px;
+                }
+                QPushButton:hover { background: rgba(0, 242, 254, 0.35); color: #FFFFFF; }
+            """)
+
+            html = ["""<div style="font-family: 'Consolas', monospace; font-size: 12px; line-height: 1.5; padding: 4px;">"""]
+            for line in content.splitlines():
+                esc = line.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                if esc.startswith("+"):
+                    html.append(f"""<div style="background: rgba(16, 185, 129, 0.14); color: #34D399; padding: 2px 8px; border-left: 3px solid #10B981; margin: 1px 0;">{esc}</div>""")
+                elif esc.startswith("-"):
+                    html.append(f"""<div style="background: rgba(239, 68, 68, 0.14); color: #F87171; padding: 2px 8px; border-left: 3px solid #EF4444; margin: 1px 0;">{esc}</div>""")
+                elif esc.startswith("@@"):
+                    html.append(f"""<div style="background: rgba(0, 242, 254, 0.10); color: #38BDF8; font-weight: bold; padding: 3px 8px; border-radius: 4px; margin: 6px 0;">{esc}</div>""")
+                elif esc.startswith("---") or esc.startswith("+++"):
+                    html.append(f"""<div style="color: #94A3B8; font-weight: bold; padding: 2px 8px;">{esc}</div>""")
+                else:
+                    html.append(f"""<div style="color: #CBD5E1; padding: 1px 8px;">{esc}</div>""")
+            html.append("</div>")
+            self._news_box.setHtml("".join(html))
+            return
+
+        # ── MODE 2: AI REASONING & RESEARCH HUD ──────────────────────────────
+        if is_thinking:
+            self._title_lbl.setText(f"🧠  {upper_title}")
+            self._title_lbl.setStyleSheet("color: #A855F7; letter-spacing: 1.2px; background: transparent; border: none;")
+            self.copy_btn.setText("📋 Copy Reasoning")
+            self.copy_btn.setStyleSheet("""
+                QPushButton {
+                    background: rgba(168, 85, 247, 0.15);
+                    color: #C084FC;
+                    border: 1.5px solid #A855F7;
+                    border-radius: 16px;
+                    padding: 0 16px;
+                }
+                QPushButton:hover { background: rgba(168, 85, 247, 0.35); color: #FFFFFF; }
+            """)
+
+            html = ["""<div style="font-family: 'Segoe UI', sans-serif; padding: 6px;">"""]
+            for line in content.splitlines():
+                l_str = line.strip()
+                if not l_str:
+                    html.append("<div style='height: 8px;'></div>")
+                    continue
+                esc = l_str.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+                if any(k in esc.upper() for k in ("PHASE", "STEP", "DIAGNOSIS", "VERIFICATION", "OVERVIEW")):
+                    html.append(f"""
+                    <div style="margin: 10px 0 4px 0;">
+                        <span style="background: rgba(0, 242, 254, 0.15); border: 1px solid #00F2FE; border-radius: 8px; padding: 3px 10px; color: #00F2FE; font-size: 11px; font-weight: bold;">▶ {esc}</span>
+                    </div>
+                    """)
+                elif esc.startswith("•") or esc.startswith("-") or esc.startswith("◆"):
+                    clean_b = esc.lstrip("•-◆").strip()
+                    if ":" in clean_b:
+                        k, v = clean_b.split(":", 1)
+                        html.append(f"""<div style="margin-left: 14px; margin-bottom: 4px; font-size: 12px; color: #F8FAFC;"><span style="color: #00F2FE; font-weight: bold; margin-right: 6px;">◆</span><b style="color: #38BDF8;">{k}:</b>{v}</div>""")
+                    else:
+                        html.append(f"""<div style="margin-left: 14px; margin-bottom: 4px; font-size: 12px; color: #F8FAFC;"><span style="color: #00F2FE; font-weight: bold; margin-right: 6px;">◆</span> {clean_b}</div>""")
+                else:
+                    html.append(f"""<div style="color: #E2E8F0; font-size: 12px; margin-bottom: 4px;">{esc}</div>""")
+            html.append("</div>")
+            self._news_box.setHtml("".join(html))
+            return
+
+        # ── MODE 3: KNOWLEDGE SEARCH & WEB RESULTS HUD ────────────────────────
+        if is_search:
+            self._title_lbl.setText(f"🔍  {upper_title}")
+            self._title_lbl.setStyleSheet("color: #38BDF8; letter-spacing: 1.2px; background: transparent; border: none;")
+            self.copy_btn.setText("📋 Copy Results")
+            self.copy_btn.setStyleSheet("""
+                QPushButton {
+                    background: rgba(56, 189, 248, 0.15);
+                    color: #38BDF8;
+                    border: 1.5px solid #38BDF8;
+                    border-radius: 16px;
+                    padding: 0 16px;
+                }
+                QPushButton:hover { background: rgba(56, 189, 248, 0.35); color: #FFFFFF; }
+            """)
+
+            html = ["""<div style="font-family: 'Segoe UI', sans-serif; padding: 6px;">"""]
+            
+            # Format direct answers prominently
+            if "Direct Answer:" in content:
+                parts = content.split("Direct Answer:", 1)
+                ans_txt = parts[1].strip()
+                html.append(f"""
+                <div style="background: rgba(0, 242, 254, 0.12); border: 1.5px solid #00F2FE; border-radius: 10px; padding: 12px 16px; margin-bottom: 16px;">
+                    <div style="color: #00F2FE; font-weight: bold; font-size: 11px; letter-spacing: 1px; margin-bottom: 4px;">⚡ DIRECT VERIFIED ANSWER</div>
+                    <div style="color: #FFFFFF; font-size: 14px; font-weight: bold; line-height: 1.4;">{ans_txt}</div>
+                </div>
+                """)
+            else:
+                for line in content.splitlines():
+                    line_s = line.strip()
+                    if not line_s:
+                        continue
+                    esc = line_s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+                    if re.match(r'^\d+\.', esc):
+                        html.append(f"""<div style="color: #38BDF8; font-weight: bold; font-size: 13px; margin-top: 10px; margin-bottom: 2px;">{esc}</div>""")
+                    elif esc.startswith("Source:"):
+                        html.append(f"""<div style="color: #94A3B8; font-size: 10px; font-family: 'Consolas', monospace; margin-bottom: 6px;"><span style="color: #00F2FE;">🔗</span> {esc}</div>""")
+                    elif esc.startswith("Web search results for:"):
+                        html.append(f"""<div style="color: #F8FAFC; font-weight: bold; font-size: 12px; margin-bottom: 8px; border-bottom: 1px solid rgba(255,255,255,0.1); padding-bottom: 4px;">{esc}</div>""")
+                    else:
+                        html.append(f"""<div style="color: #E2E8F0; font-size: 12px; line-height: 1.45; margin-left: 8px; margin-bottom: 4px;">{esc}</div>""")
+
+            html.append("</div>")
+            self._news_box.setHtml("".join(html))
+            return
+
+        # ── MODE 4: WORLD NEWS BRIEFING (NEVER DROPS DETAIL LINES) ────────────
+        self._title_lbl.setText(f"📰  {upper_title}")
+        self._title_lbl.setStyleSheet("color: #FBBF24; letter-spacing: 1.2px; background: transparent; border: none;")
+        self.copy_btn.setText("📋 Copy Briefing")
+        self.copy_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(251, 188, 5, 0.16);
+                color: #FEF08A;
+                border: 1.5px solid #FBBC05;
+                border-radius: 16px;
+                padding: 0 16px;
+            }
+            QPushButton:hover { background: rgba(251, 188, 5, 0.38); color: #FFFFFF; }
+        """)
 
         story_blocks = [b.strip() for b in content.split("---") if b.strip()]
         if not story_blocks:
@@ -4050,43 +4497,31 @@ class FullNewsView(QWidget):
         cards_html = ""
         for i, block in enumerate(story_blocks):
             lines = [l.strip() for l in block.split("\n") if l.strip()]
-            headline = ""
-            source = "Global Wire"
-            detail = ""
-
+            headline, source, detail_lines = "", "Global News", []
             for line in lines:
                 if line.startswith("HEADLINE:"):
                     parts = line.replace("HEADLINE:", "").split("| SOURCE:")
                     headline = parts[0].strip()
-                    if len(parts) > 1:
-                        source = parts[1].strip()
+                    if len(parts) > 1: source = parts[1].strip()
                 elif line.startswith("DETAIL:"):
-                    detail = line.replace("DETAIL:", "").strip()
+                    detail_lines.append(line.replace("DETAIL:", "").strip())
                 elif not headline:
                     headline = line
+                else:
+                    detail_lines.append(line)
+
+            full_detail = " ".join(detail_lines).strip()
 
             cards_html += f"""
             <div style="margin-bottom: 18px; padding-left: 2px;">
                 <div style="margin-bottom: 5px;">
-                    <span style="
-                        background: rgba(255, 255, 255, 0.06);
-                        border: 1px solid rgba(251, 188, 5, 0.40);
-                        border-radius: 12px;
-                        padding: 2px 10px;
-                        color: #FBBC05;
-                        font-size: 10px;
-                        font-weight: bold;
-                        letter-spacing: 0.8px;
-                    ">● STORY #{i+1}</span>
+                    <span style="background: rgba(255, 255, 255, 0.06); border: 1px solid rgba(251, 188, 5, 0.40); border-radius: 12px; padding: 2px 10px; color: #FBBC05; font-size: 10px; font-weight: bold;">● STORY #{i+1}</span>
                     <span style="color: #FDE047; font-size: 10px; font-weight: bold; margin-left: 6px;">[{source}]</span>
                 </div>
-                <div style="color: #FFFFFF; font-size: 13px; font-weight: bold; line-height: 1.4; margin-top: 4px; margin-bottom: 4px;">
-                    {headline}
-                </div>
-                {f'<div style="color: #CBD5E1; font-size: 11px; line-height: 1.45;">{detail}</div>' if detail else ''}
+                <div style="color: #FFFFFF; font-size: 13px; font-weight: bold; line-height: 1.4; margin-top: 4px; margin-bottom: 4px;">{headline}</div>
+                {f'<div style="color: #CBD5E1; font-size: 11px; line-height: 1.45;">{full_detail}</div>' if full_detail else ''}
             </div>
             """
-
         self._news_box.setHtml(cards_html)
 
     def _copy_all_news(self):
@@ -5365,6 +5800,77 @@ class FullPluginsView(QWidget):
                 """)
         except Exception:
             pass
+            
+# ── FULL-WINDOW VIEW 5: DEDICATED SATELLITE SPATIAL FLEET HUD ────────────────
+class FullSpatialMapView(QWidget):
+    back_requested = pyqtSignal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAttribute(Qt.WidgetAttribute.WA_OpaquePaintEvent)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 14, 18, 14)
+        root.setSpacing(10)
+
+        # Top Header Bar with BACK button
+        hdr_frame = QWidget()
+        hdr_frame.setFixedHeight(44)
+        hdr = QHBoxLayout(hdr_frame)
+        hdr.setContentsMargins(0, 0, 0, 0)
+        hdr.setSpacing(12)
+
+        self.back_btn = QPushButton("← BACK TO CORE")
+        self.back_btn.setFixedSize(140, 32)
+        self.back_btn.setFont(QFont("Segoe UI", 8, QFont.Weight.Bold))
+        self.back_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.back_btn.setStyleSheet("""
+            QPushButton {
+                background: rgba(0, 242, 254, 0.16);
+                color: #E0F2FE;
+                border: 1.5px solid #00F2FE;
+                border-radius: 16px;
+                letter-spacing: 0.8px;
+            }
+            QPushButton:hover {
+                background: rgba(0, 242, 254, 0.38);
+                color: #FFFFFF;
+                border-color: #38BDF8;
+            }
+            QPushButton:pressed {
+                background: rgba(0, 242, 254, 0.55);
+            }
+        """)
+        self.back_btn.clicked.connect(self.back_requested.emit)
+        hdr.addWidget(self.back_btn)
+
+        title = QLabel("🛰️  SPATIAL FLEET TELEMETRY & 3D SATELLITE RADAR")
+        title.setFont(QFont("Segoe UI", 9, QFont.Weight.Bold))
+        title.setStyleSheet("color: #00F2FE; letter-spacing: 1.2px; background: transparent; border: none;")
+        hdr.addWidget(title)
+
+        hdr.addStretch()
+
+        self.status_chip = QLabel("● GPS / 5G ACTIVE")
+        self.status_chip.setFixedHeight(28)
+        self.status_chip.setFont(QFont("Consolas", 8, QFont.Weight.Bold))
+        self.status_chip.setStyleSheet("""
+            color: #10B981;
+            background: rgba(16, 185, 129, 0.12);
+            border: 1px solid rgba(16, 185, 129, 0.40);
+            border-radius: 14px;
+            padding: 2px 12px;
+        """)
+        hdr.addWidget(self.status_chip)
+        root.addWidget(hdr_frame)
+
+        # Embedded Interactive Leaflet Canvas
+        self.canvas = SpatialMapCanvas()
+        root.addWidget(self.canvas, stretch=1)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.fillRect(self.rect(), QColor("#030712"))
 
 # ── 7. Helper Logger Shim (Prevents any AttributeError) ───────────────────────
 class _LogShim:
@@ -5861,6 +6367,10 @@ class MainWindow(QMainWindow):
         self.sidebar.eye_toggled.connect(self._toggle_eye_tracking)
         self.sidebar.head_toggled.connect(self._toggle_head_tracking)
         self.sidebar.matrix_toggled.connect(self._toggle_matrix_mode)
+        self.sidebar.remote_clicked.connect(self._open_remote_overlay)
+        self.sidebar.remote_clicked.connect(self._open_remote_overlay)
+        self.sidebar.devices_clicked.connect(self._toggle_spatial_tracker)  # <── Added
+        self.sidebar.stop_clicked.connect(self._do_interrupt)
         self.sidebar.stop_clicked.connect(self._do_interrupt)
         self.top_capsule.profile_clicked.connect(self._open_customize)
         self.top_capsule.profile_clicked.connect(lambda: self.hud.play_sfx("nav_settings"))
@@ -5894,6 +6404,9 @@ class MainWindow(QMainWindow):
         self.view_stack.addWidget(self.full_news_view)    # Index 2
         self.view_stack.addWidget(self.full_metrics_view) # Index 3
         self.view_stack.addWidget(self.full_plugins_view) # Index 4
+        self.full_map_view = FullSpatialMapView()
+        self.full_map_view.back_requested.connect(self._return_to_core)
+        self.view_stack.addWidget(self.full_map_view)     # Index 5
         self.full_chat_view._anim_timer.stop()
         self.full_news_view._anim_timer.stop()
         self.full_metrics_view._anim_timer.stop()
@@ -5985,11 +6498,30 @@ class MainWindow(QMainWindow):
     def _apply_cyberpunk_theme(self, active: bool):
         """Kept as a safe no-op to preserve standard OLED matte frosted UI."""
         pass
+        
+    def _toggle_spatial_tracker(self):
+        """Switches to the full clean spatial map without any overlapping dashboard widgets."""
+        is_map_open = (self.view_stack.currentIndex() == 5)
+        if is_map_open:
+            self._return_to_core()
+        else:
+            try:
+                from actions.device_tracker import _ensure_host_device_registered, _load_devices
+                _ensure_host_device_registered()
+                devices = _load_devices()
+            except Exception:
+                devices = {}
+
+            self.full_map_view.canvas.set_fleet(devices)
+            self.view_stack.setCurrentIndex(5)
+            self.sidebar.set_devices_state(True)
+            self._on_log(f"SYS: 🛰️ Spatial Map opened ({len(devices)} active nodes).")
 
     def _return_to_core(self):
         self.hud.play_sfx("back_to_core")  # Distinct spatial return sound!
         self.view_stack.setCurrentIndex(0)
         self.sidebar.set_active_tab("core")
+        self.sidebar.set_devices_state(False)
         self.hud.run_js("if(window.NexusCore) { window.dispatchEvent(new Event('resize')); }")
 
     def _handle_quick_action(self, action_key: str):
@@ -6244,6 +6776,37 @@ class MainWindow(QMainWindow):
         ov.setGeometry((self.width() - 380) // 2, (self.height() - 310) // 2, 380, 310)
         ov.saved.connect(self._apply_identity)
         ov.show()
+        
+    def _open_remote_overlay(self):
+        if not self.on_remote_clicked:
+            self._on_log("SYS: Remote server not available.")
+            return
+
+        res = self.on_remote_clicked()
+        if not res:
+            self._on_log("SYS: Could not create remote session key.")
+            return
+
+        url, key, auto_login_url, manual_url = res
+
+        if self._remote_overlay:
+            try:
+                self._remote_overlay.close()
+                self._remote_overlay.deleteLater()
+            except Exception:
+                pass
+            self._remote_overlay = None
+
+        self.hud.play_sfx("nav_settings")
+        ov = RemoteKeyOverlay(url, key, auto_login_url, manual_url, parent=self._central)
+        ov.set_new_key_callback(self.on_remote_clicked)
+
+        ov_w, ov_h = 400, 540
+        ov.setGeometry((self.width() - ov_w) // 2, (self.height() - ov_h) // 2, ov_w, ov_h)
+        ov.closed.connect(lambda: setattr(self, "_remote_overlay", None))
+        ov.show()
+        ov.raise_()
+        self._remote_overlay = ov
 
     def _apply_identity(self, name: str, user_name: str, voice_name: str, color_hex: str):
         self._assistant_name = name
@@ -6505,7 +7068,7 @@ class JarvisUI:
     def set_connection_status(self, text: str): self._win._connection_sig.emit(text)
     def wait_for_api_key(self):
         while not self._win._ready: time.sleep(0.1)
-    def show_content(self, title: str, text: str): self._win._content_sig.emit(title[:48], text[:4000])
+    def show_content(self, title: str, text: str): self._win._content_sig.emit(title[:48], text[:15000])
     def prompt_reconfig(self): self._win._ready = False; self._win._reconfig_sig.emit()
     def show_camera_frame(self, img_bytes: bytes): self._win._camera_sig.emit(img_bytes)
     def start_camera_stream(self) -> None: self._win.start_camera_stream()

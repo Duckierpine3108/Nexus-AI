@@ -287,32 +287,137 @@ def _scrape_video_info(video_id: str) -> dict:
         print(f"[YouTube] ⚠️ Info scrape failed: {e}")
         return {}
 
+def _scrape_trending(region: str = "PK", max_results: int = 5) -> list[dict]:
+    """
+    Extracts live trending videos in Pakistan using chunk-based slicing,
+    with an automatic Gemini Live Search Grounding fallback.
+    """
+    results = []
+    seen = set()
+    reg = (region or "PK").upper()
 
-def _scrape_trending(region: str = "TR", max_results: int = 8) -> list[dict]:
-    if not _REQUESTS_OK:
-        return []
-    url = f"https://www.youtube.com/feed/trending?gl={region.upper()}"
+    # Step 1: Chunk-based parsing of YouTube Pakistan search results
+    search_query = "trending in pakistan today" if reg == "PK" else f"trending videos in {reg} today"
+    url = f"https://www.youtube.com/results?search_query={quote_plus(search_query)}"
+
     try:
-        r    = requests.get(url, headers=HEADERS, timeout=12)
+        r = requests.get(url, headers=HEADERS, timeout=10)
         html = r.text
 
-        titles   = re.findall(r'"title":\{"runs":\[\{"text":"([^"]+)"\}\]', html)
-        channels = re.findall(r'"ownerText":\{"runs":\[\{"text":"([^"]+)"', html)
-
-        results, seen = [], set()
-        for i, title in enumerate(titles):
-            if title in seen or len(title) < 5:
+        # Slicing by "videoRenderer" isolates each video card and ignores newlines
+        chunks = html.split('"videoRenderer":')[1:]
+        for chunk in chunks:
+            vid_m = re.search(r'"videoId":"([A-Za-z0-9_-]{11})"', chunk)
+            if not vid_m:
                 continue
-            seen.add(title)
-            channel = channels[i] if i < len(channels) else "Unknown"
-            results.append({"rank": len(results) + 1, "title": title, "channel": channel})
+            vid = vid_m.group(1)
+            if vid in seen or f"/shorts/{vid}" in chunk:
+                continue
+
+            title_m = re.search(r'"title":\{.*?"text":"([^"]+)"', chunk, re.DOTALL)
+            channel_m = re.search(r'"(?:ownerText|longBylineText)":\{.*?"text":"([^"]+)"', chunk, re.DOTALL)
+
+            title = title_m.group(1).strip() if title_m else ""
+            channel = channel_m.group(1).strip() if channel_m else "YouTube Creator"
+
+            # Filter out navigation and shortcut tooltips
+            junk = ["keyboard", "try searching", "playback", "settings", "feedback"]
+            if not title or len(title) < 4 or any(j in title.lower() for j in junk):
+                continue
+
+            seen.add(vid)
+            results.append({
+                "rank": len(results) + 1,
+                "title": title,
+                "channel": channel,
+                "url": f"https://www.youtube.com/watch?v={vid}"
+            })
             if len(results) >= max_results:
                 break
-
-        return results
     except Exception as e:
-        print(f"[YouTube] ⚠️ Trending scrape failed: {e}")
-        return []
+        print(f"[YouTube] ⚠️ Direct search scrape notice: {e}")
+
+    # Step 2: Live AI Grounding Fallback (If YouTube blocks raw requests)
+    if not results:
+        print(f"[YouTube] 🌐 Engaging Gemini Google Search Grounding for {reg} trending...")
+        try:
+            from google import genai as _genai
+            from google.genai import types
+
+            api_key = _get_api_key()
+            if api_key:
+                client = _genai.Client(api_key=api_key)
+                prompt = (
+                    f"What are the top 5 trending YouTube videos in {reg} today? "
+                    "Provide a numbered list with the video title and channel name."
+                )
+                resp = client.models.generate_content(
+                    model="gemini-2.5-flash",
+                    contents=prompt,
+                    config=types.GenerateContentConfig(
+                        tools=[types.Tool(google_search=types.GoogleSearch())],
+                        temperature=0.2,
+                    )
+                )
+                if resp and resp.text:
+                    lines = [ln.strip() for ln in resp.text.split("\n") if ln.strip()]
+                    rank = 1
+                    for line in lines:
+                        clean_ln = re.sub(r"^[\*\d\.\-\s]+", "", line).strip()
+                        if clean_ln and len(clean_ln) > 5 and not clean_ln.startswith("#"):
+                            parts = clean_ln.split(" - ") if " - " in clean_ln else clean_ln.split(" by ")
+                            title = parts[0].strip(' "*')
+                            channel = parts[1].strip(' "*') if len(parts) > 1 else "Trending Creator"
+                            results.append({
+                                "rank": rank,
+                                "title": title,
+                                "channel": channel,
+                                "url": f"https://www.youtube.com/results?search_query={quote_plus(title)}"
+                            })
+                            rank += 1
+                            if len(results) >= max_results:
+                                break
+        except Exception as ai_err:
+            print(f"[YouTube] ⚠️ Grounding fallback notice: {ai_err}")
+
+    return results
+
+
+def _handle_trending(parameters: dict, player, speak) -> str:
+    # Always default to Pakistan (PK) for Kamran Jalil
+    user_query = str(parameters.get("query", "")).lower()
+
+    if any(k in user_query for k in ["usa", "america", "united states", "in us"]):
+        region = "US"
+    elif any(k in user_query for k in ["uk", "britain", "england"]):
+        region = "GB"
+    elif any(k in user_query for k in ["india", "bharat"]):
+        region = "IN"
+    else:
+        region = "PK"
+
+    if player:
+        player.write_log(f"[YouTube] Fetching trending videos for: {region}")
+
+    trending = _scrape_trending(region=region, max_results=5)
+    country_name = "Pakistan" if region == "PK" else region
+
+    if not trending:
+        return f"Could not retrieve trending videos for {country_name} right now, sir."
+
+    lines = [f"Top trending videos in {country_name}:"]
+    lines += [f"{v['rank']}. {v['title']} — {v['channel']}" for v in trending]
+    result = "\n".join(lines)
+
+    if speak:
+        top1 = trending[0]
+        spoken = f"The top trending video in Pakistan right now is {top1['title']} by {top1['channel']}."
+        if len(trending) > 1:
+            top2 = trending[1]
+            spoken += f" Followed by {top2['title']} by {top2['channel']}."
+        speak(spoken)
+
+    return result
 
 def _handle_play(parameters: dict, player) -> str:
     query = parameters.get("query", "").strip()
@@ -421,38 +526,6 @@ def _handle_get_info(parameters: dict, player, speak) -> str:
         speak(f"Here's the video info, sir. {result.replace(chr(10), '. ')}")
 
     return result
-
-
-def _handle_trending(parameters: dict, player, speak) -> str:
-    region = parameters.get("region", "TR").upper()
-
-    if player:
-        player.write_log(f"[YouTube] Trending: {region}")
-
-    trending = _scrape_trending(region=region, max_results=8)
-    if not trending:
-        return f"Could not fetch trending videos for region {region}, sir."
-
-    lines  = [f"Top trending videos in {region}:"]
-    lines += [f"{v['rank']}. {v['title']} — {v['channel']}" for v in trending]
-    result = "\n".join(lines)
-
-    if speak:
-        top3   = trending[:3]
-        spoken = "Here are the top trending videos, sir. " + ". ".join(
-            f"Number {v['rank']}: {v['title']} by {v['channel']}" for v in top3
-        )
-        speak(spoken)
-
-    return result
-
-_ACTION_MAP = {
-    "play":      _handle_play,
-    "summarize": _handle_summarize,
-    "get_info":  _handle_get_info,
-    "trending":  _handle_trending,
-}
-
 
 def youtube_video(
     parameters:     dict,
